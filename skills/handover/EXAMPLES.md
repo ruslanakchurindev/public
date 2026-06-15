@@ -49,3 +49,17 @@ Generated: 2026-06-10T14:32:08Z | Repo: billing-service | Workspace: billing-pla
 2. Confirm Stripe event-id uniqueness across modes in their docs
 3. Ask user to review migration 0042, then commit remaining changes
 ```
+
+## Conversation state in a mixed session
+
+The artifact above omits "Conversation state that matters" — it was pure coding.
+When a session's value is reasoning (here: deciding what to tell a reviewer who
+pushed back), that block carries the irrecoverable part and sits right under
+"Resume here":
+
+```markdown
+## Conversation state that matters
+- User's real concern / stakeholder positions: User must answer a reviewer who argued the dedup belongs in the API gateway, not the service. User leans service-level but isn't certain and doesn't want to relitigate it in PR comments.
+- Accepted framing — and what was rejected, and why: Framed as "idempotency is a billing-domain invariant, so it lives with the billing data" — accepted. Rejected the gateway framing: the gateway can't see the Postgres unique constraint that actually guarantees correctness, so it could only best-effort dedupe.
+- Wording or tone to preserve: Keep the reply collaborative, not defeating — acknowledge the gateway idea has merit for coarse rate-limiting before making the domain-invariant point.
+```

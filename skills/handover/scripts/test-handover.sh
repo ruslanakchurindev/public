@@ -159,4 +159,36 @@ state_output="$(HANDOVER_HOME="$home" "$handover" state "$repo")"
 [[ "$state_output" == *"## Git"* ]] || fail "state output missing git section"
 [[ "$state_output" == *"repo: $repo_root"* ]] || fail "state output missing repo path"
 
+# --- Skill documentation contract -------------------------------------------
+# The skill's whole point is preserving irrecoverable conversation state, not
+# repo mechanics the next agent can re-derive. These checks lock that contract
+# into SKILL.md/EXAMPLES.md so a later edit can't quietly regress the handover
+# back to a repo-state-only artifact.
+skill_root="$(cd "$script_dir/.." && pwd)"
+skill_md="$skill_root/SKILL.md"
+examples_md="$skill_root/EXAMPLES.md"
+[[ -f "$skill_md" ]] || fail "SKILL.md not found at $skill_md"
+[[ -f "$examples_md" ]] || fail "EXAMPLES.md not found at $examples_md"
+
+grep -q '^## Conversation state that matters$' "$skill_md" \
+  || fail "SKILL.md output format lost the 'Conversation state that matters' section"
+
+# Irrecoverable conversation state must precede recoverable repo mechanics.
+conv_line="$(grep -n '^## Conversation state that matters$' "$skill_md" | head -1 | cut -d: -f1)"
+ws_line="$(grep -n '^## Workspace state$' "$skill_md" | head -1 | cut -d: -f1)"
+[[ -n "$conv_line" && -n "$ws_line" ]] || fail "could not locate ordering anchors in SKILL.md"
+[[ "$conv_line" -lt "$ws_line" ]] || fail "Conversation state must appear before Workspace state in SKILL.md"
+
+grep -qi 'could not be reconstructed from Git' "$skill_md" \
+  || fail "SKILL.md lost the pre-save sanity check (irrecoverable items go first)"
+
+grep -qi 'what should I tell X' "$skill_md" \
+  || fail "SKILL.md lost the reasoning-session capture trigger"
+
+grep -q 'Conversation state that matters.*remain valid' "$skill_md" \
+  || fail "resume drift guidance must list 'Conversation state that matters' as still-valid"
+
+grep -q '^## Conversation state that matters$' "$examples_md" \
+  || fail "EXAMPLES.md no longer demonstrates the conversation-state section"
+
 printf 'handover script tests passed\n'
