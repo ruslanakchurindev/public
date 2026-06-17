@@ -46,8 +46,12 @@ Artifacts live under `<HANDOVER_HOME>/<repo-basename>-<path-hash>/` with private
 permissions (directories `700`, files `600`).
 
 Keep `HANDOVER_HOME` on a private, non-shared path — the store is not hardened against
-a symlinked or world-writable location. The `<path-hash>` is derived from the repo's
-absolute path, so moving the repo directory starts a fresh store; earlier handovers
+a symlinked or world-writable location. The `<path-hash>` is derived from the
+repository's shared git directory, so **all linked worktrees of one repo share a single
+store** — a handover saved in a worktree is found by `latest`/`list` from the main
+checkout or any sibling worktree, and the metadata's `workspace` / `workspace-path`
+record which worktree produced it. Use `--name` when concurrent worktrees need separate
+`latest` pointers. Moving the repo directory starts a fresh store; earlier handovers
 remain under the old path.
 
 ## Privacy

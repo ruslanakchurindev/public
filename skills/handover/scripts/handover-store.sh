@@ -76,7 +76,31 @@ if [[ -n "$name" && "$name" == latest* ]]; then
 fi
 
 abs="$(cd "$target" && pwd)"
-base="$(git -C "$abs" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$abs")"
+# Key the store off the repository, not the working directory. Every linked
+# worktree of one repo has a distinct `--show-toplevel`, so keying off that would
+# scatter a single repo's handovers into one store per worktree -- a resume from
+# the main checkout (or a sibling worktree) then can't find them. The common git
+# dir is shared by all worktrees of a repo, so it yields one stable per-repo key.
+common="$(git -C "$abs" rev-parse --git-common-dir 2>/dev/null || true)"
+if [[ -n "$common" ]]; then
+  # --git-common-dir is relative to $abs in the main worktree (".git") and
+  # absolute in a linked worktree. Resolve both to the same physical path with
+  # `pwd -P`: git hands back a symlink-resolved path for a linked worktree, so
+  # the main checkout must resolve symlinks too or the two keys diverge. This
+  # also matches the old --show-toplevel form, keeping existing stores stable.
+  common="$(cd "$abs" && cd "$common" 2>/dev/null && pwd -P || printf '%s' "$common")"
+  if [[ "$(basename "$common")" == ".git" ]]; then
+    # Standard layout: repo root is the parent of ".git". This equals the old
+    # --show-toplevel value for a non-worktree repo, so existing stores keep
+    # resolving; only worktrees change (now sharing the main repo's store).
+    base="$(dirname "$common")"
+  else
+    # Bare repo or unusual gitdir: use the common dir itself as the identity.
+    base="$common"
+  fi
+else
+  base="$abs"
+fi
 repo_name="${HANDOVER_REPO_NAME:-$(basename "$base")}"
 workspace_name="${HANDOVER_WORKSPACE_NAME:-$(basename "$abs")}"
 model_name="${HANDOVER_MODEL_NAME:-unknown}"
@@ -112,6 +136,7 @@ write_metadata_header() {
   printf 'generated: %s\n' "$generated"
   printf 'repo: %s\n' "$(metadata_value "$repo_name")"
   printf 'workspace: %s\n' "$(metadata_value "$workspace_name")"
+  printf 'workspace-path: %s\n' "$(metadata_value "$abs")"
   printf 'model: %s\n' "$(metadata_value "$model_name")"
   printf 'name: %s\n' "$(metadata_value "${name:-default}")"
   printf -- '-->\n\n'

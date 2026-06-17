@@ -134,6 +134,34 @@ if HANDOVER_HOME="$home" "$handover" list "$empty_repo" >/dev/null 2>&1; then
   fail "list on an empty store dir should exit non-zero"
 fi
 
+# Linked worktrees of one repo must share a single store: a handover saved in a
+# worktree is found by latest/list run from the main checkout, and vice versa.
+# Keying off the worktree path (the old bug) scattered them into separate stores.
+wt_home="$tmp/wt-handovers"
+wt_main="$tmp/wt-main"
+mkdir -p "$wt_main"
+git -C "$wt_main" init -q
+git -C "$wt_main" config user.name "Handover Test"
+git -C "$wt_main" config user.email "handover-test@example.invalid"
+printf 'fixture\n' > "$wt_main/file.txt"
+git -C "$wt_main" add file.txt
+git -C "$wt_main" commit -q -m "Initial fixture"
+wt_linked="$tmp/wt-linked"
+git -C "$wt_main" worktree add -q "$wt_linked" -b feature
+
+main_store="$(HANDOVER_HOME="$wt_home" "$handover" path "$wt_main")"
+linked_store="$(HANDOVER_HOME="$wt_home" "$handover" path "$wt_linked")"
+[[ "$main_store" == "$linked_store" ]] || fail "worktree and main checkout resolved to different stores: $main_store vs $linked_store"
+
+wt_artifact="$(printf '# From worktree\n' | HANDOVER_HOME="$wt_home" "$handover" save "$wt_linked")"
+[[ "$(HANDOVER_HOME="$wt_home" "$handover" latest "$wt_main")" == "$wt_artifact" ]] || fail "handover saved in linked worktree not found from main checkout"
+grep -q "^workspace-path: $wt_linked$" "$wt_artifact" || fail "artifact metadata missing originating worktree path"
+
+main_artifact="$(printf '# From main\n' | HANDOVER_HOME="$wt_home" "$handover" save "$wt_main")"
+[[ "$(HANDOVER_HOME="$wt_home" "$handover" latest "$wt_linked")" == "$main_artifact" ]] || fail "handover saved in main checkout not found from linked worktree"
+wt_all_count="$(HANDOVER_HOME="$wt_home" "$handover" list "$wt_linked" | wc -l | tr -d ' ')"
+[[ "$wt_all_count" == "2" ]] || fail "shared worktree store should list both artifacts, got $wt_all_count"
+
 bare_repo="$tmp/bare.git"
 git init -q --bare "$bare_repo"
 bare_state="$(HANDOVER_HOME="$home" "$handover" state "$bare_repo" 2>&1 || true)"
