@@ -1,20 +1,28 @@
-# Skills
+# Public tools
 
-Public, agent-agnostic skills. Each one is self-contained under `skills/<name>/`
-(a `SKILL.md` plus any scripts and references it needs) and works with any agent
-that loads the `SKILL.md` skill convention.
+Small, self-contained command-line helpers and agent skills.
 
-## Skills
+## Zsh customizations
+
+- **[caffeinate](zsh/caffeinate.zsh)** — `caf` and `decaf` manage one tracked
+  macOS `caffeinate` session, including optional durations in hours.
+- **[worktrees](zsh/worktrees.zsh)** — `wt` discovers, creates, opens, syncs,
+  removes, and publishes Git worktree-based workspaces.
+
+See the **[Zsh README](zsh/README.md)** for requirements, installation, command
+reference, configuration, and safety notes.
+
+## Agent skills
 
 - **[handover](skills/handover/)** — package a coding session's decisions, failed
   approaches, constraints, and next steps into a portable handover artifact stored
   outside the repo, then load the latest one to pick up later.
   See [skills/handover/README.md](skills/handover/README.md).
 
-## Install
+### Install a skill
 
-Symlink a skill into your agent's skill directory rather than copying it — keep one
-source copy so updates don't drift:
+Symlink a skill into your agent's skill directory rather than copying it. This
+keeps one source copy, so updates do not drift:
 
 ```bash
 ln -s "$PWD/skills/handover" ~/.claude/skills/handover
