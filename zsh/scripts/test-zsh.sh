@@ -4,6 +4,7 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 zsh_dir="$(cd "$script_dir/.." && pwd)"
 caffeinate_script="$zsh_dir/caffeinate.zsh"
+gpull_script="$zsh_dir/gpull.zsh"
 worktrees_script="$zsh_dir/worktrees.zsh"
 
 fail() {
@@ -21,14 +22,22 @@ mode_of() {
 
 command -v zsh >/dev/null 2>&1 || fail "zsh is required"
 [[ -f "$caffeinate_script" ]] || fail "caffeinate.zsh not found"
+[[ -f "$gpull_script" ]] || fail "gpull.zsh not found"
 [[ -f "$worktrees_script" ]] || fail "worktrees.zsh not found"
 
 zsh -n "$caffeinate_script"
+zsh -n "$gpull_script"
 zsh -n "$worktrees_script"
 
 tmp="$(mktemp -d)"
 tmp="$(cd "$tmp" && pwd -P)"
-trap 'rm -rf "$tmp"' EXIT
+cleanup() {
+  if [[ -n "${gpull_unreadable_base:-}" && -d "$gpull_unreadable_base" ]]; then
+    chmod 700 "$gpull_unreadable_base" 2>/dev/null || :
+  fi
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
 
 # caf/decaf validation and dispatch are tested without starting caffeinate.
 CAF_SCRIPT="$caffeinate_script" TMPDIR="$tmp" zsh -f <<'ZSH'
@@ -81,6 +90,350 @@ if _caf_track 4242 >/dev/null 2>&1; then
 fi
 ZSH
 [[ ! -e "$unsafe_target/pid" ]] || fail "caf wrote through an unsafe state directory"
+
+# gpull validates configuration, caps its own workers, and ignores unrelated jobs.
+gpull_fake_base="$tmp/gpull-fake"
+gpull_empty_base="$tmp/gpull-empty"
+gpull_missing_base="$tmp/gpull-missing"
+gpull_unreadable_base="$tmp/gpull-unreadable"
+gpull_events="$tmp/gpull-events.log"
+mkdir -p "$gpull_empty_base" "$gpull_unreadable_base"
+chmod 000 "$gpull_unreadable_base"
+for name in alpha beta delta epsilon gamma zeta; do
+  mkdir -p "$gpull_fake_base/$name/.git"
+done
+
+GPULL_SCRIPT="$gpull_script" \
+GPULL_FAKE_BASE="$gpull_fake_base" \
+GPULL_EMPTY_BASE="$gpull_empty_base" \
+GPULL_MISSING_BASE="$gpull_missing_base" \
+GPULL_UNREADABLE_BASE="$gpull_unreadable_base" \
+GPULL_EVENTS="$gpull_events" \
+zsh -f <<'ZSH'
+typeset -g _GPULL_CODE_BASE="$GPULL_EMPTY_BASE"
+source "$GPULL_SCRIPT"
+
+(( $+functions[gpull] )) || exit 1
+[[ "$(_GPULL_JOBS=2 gpull)" == "no repos under $GPULL_EMPTY_BASE" ]] || exit 1
+[[ "$(_GPULL_JOBS=1000000 gpull)" == "no repos under $GPULL_EMPTY_BASE" ]] || {
+  print -u2 'gpull rejected a valid large worker count'
+  exit 1
+}
+for invalid_base in "$GPULL_MISSING_BASE" "$GPULL_UNREADABLE_BASE"; do
+  invalid_output=$(_GPULL_CODE_BASE="$invalid_base" gpull 2>&1)
+  invalid_rc=$?
+  [[ $invalid_rc == 2 ]] || {
+    print -u2 "gpull accepted an unreadable code root: $invalid_base"
+    exit 1
+  }
+  [[ "$invalid_output" == *'gpull: _GPULL_CODE_BASE is not a readable directory:'* ]] || {
+    print -u2 "gpull did not report the invalid code root: $invalid_output"
+    exit 1
+  }
+done
+if _GPULL_JOBS=0 gpull >/dev/null 2>&1; then
+  print -u2 'gpull accepted zero workers'
+  exit 1
+fi
+if _GPULL_JOBS=lots gpull >/dev/null 2>&1; then
+  print -u2 'gpull accepted a non-numeric worker count'
+  exit 1
+fi
+
+_GPULL_CODE_BASE="$GPULL_FAKE_BASE"
+_GPULL_JOBS=2
+_gpull_one() {
+  print -r -- "start:${1:t}" >> "$GPULL_EVENTS"
+  if [[ "${1:t}" == alpha ]]; then
+    sleep 0.35
+  else
+    sleep 0.05
+  fi
+  print -r -- "end:${1:t}" >> "$GPULL_EVENTS"
+  print -r -- "→ ${1:t}"
+  print -r -- '    up to date'
+}
+
+unsetopt bg_nice
+sleep 2 &
+unrelated=$!
+setopt bg_nice
+output=$(gpull) || exit 1
+kill -0 "$unrelated" 2>/dev/null || {
+  print -u2 'gpull waited for an unrelated background job'
+  exit 1
+}
+kill "$unrelated" 2>/dev/null || :
+wait "$unrelated" 2>/dev/null || :
+
+[[ "$output" == *$'6 ok  0 skipped  0 failed  (jobs=2)'* ]] || exit 1
+repo_headers=$(print -r -- "$output" | sed -n '/^→ /p')
+[[ "$repo_headers" == $'→ alpha\n→ beta\n→ delta\n→ epsilon\n→ gamma\n→ zeta' ]] || {
+  print -u2 'gpull did not print repositories in directory order'
+  exit 1
+}
+ZSH
+chmod 700 "$gpull_unreadable_base"
+
+event_stats=$(awk -F: '
+  $1 == "start" { active++; starts++; if (active > max) max = active }
+  $1 == "end" { active--; ends++ }
+  END { printf "%d %d %d %d", starts, ends, max, active }
+' "$gpull_events")
+[[ "$event_stats" == "6 6 2 0" ]] || fail "gpull worker cap was not respected: $event_stats"
+if ! awk '
+  $0 == "start:delta" { delta_start = NR }
+  $0 == "end:alpha" { alpha_end = NR }
+  END { exit !(delta_start && alpha_end && delta_start < alpha_end) }
+' "$gpull_events"; then
+  fail "gpull left a worker slot idle behind the oldest repository"
+fi
+
+# Discovery is explicit about hidden directories and follows symlinks to direct
+# repository directories, independent of the caller's GLOB_DOTS option.
+gpull_discovery_base="$tmp/gpull-discovery"
+gpull_symlink_target="$tmp/gpull-symlink-target"
+mkdir -p "$gpull_discovery_base/.hidden/.git" "$gpull_symlink_target/.git"
+ln -s "$gpull_symlink_target" "$gpull_discovery_base/linked"
+discovery_output=$(
+  GPULL_SCRIPT="$gpull_script" \
+  GPULL_DISCOVERY_BASE="$gpull_discovery_base" \
+  zsh -f <<'ZSH'
+typeset -g _GPULL_CODE_BASE="$GPULL_DISCOVERY_BASE"
+typeset -g _GPULL_JOBS=2
+source "$GPULL_SCRIPT"
+unsetopt glob_dots
+_gpull_one() {
+  print -r -- "→ ${1:t}"
+  print -r -- '    up to date'
+}
+gpull
+ZSH
+)
+discovery_headers=$(printf '%s\n' "$discovery_output" | sed -n '/^→ /p')
+[[ "$discovery_headers" == $'→ .hidden\n→ linked' ]] ||
+  fail "gpull omitted hidden or symlinked repositories: $discovery_output"
+
+# Operational Git probe errors stay distinct from semantic absence, detached
+# HEAD, and divergence.
+GPULL_SCRIPT="$gpull_script" zsh -f <<'ZSH'
+source "$GPULL_SCRIPT"
+
+fake_git() {
+  case "$3" in
+    fetch)
+      return 0
+      ;;
+    rev-parse)
+      local ref="${@[-1]}"
+      if [[ "$ref" == refs/heads/main ]]; then
+        case "$_GPULL_FAKE_MODE" in
+          local-error) return 128 ;;
+          no-main) return 1 ;;
+          *) print -r -- local; return 0 ;;
+        esac
+      fi
+      [[ "$_GPULL_FAKE_MODE" == ancestry-error ]] && print -r -- remote || print -r -- local
+      return 0
+      ;;
+    symbolic-ref)
+      [[ "$_GPULL_FAKE_MODE" == head-error ]] && return 128
+      print -r -- topic
+      return 0
+      ;;
+    merge-base)
+      if [[ "$_GPULL_FAKE_MODE" == ancestry-error ]]; then
+        [[ "$5" == local ]] && return 1
+        return 128
+      fi
+      return 0
+      ;;
+  esac
+  return 128
+}
+
+typeset -g _GPULL_GIT=fake_git
+check_probe() {
+  local mode="$1" expected_rc="$2" expected_text="$3"
+  local output rc
+  _GPULL_FAKE_MODE="$mode"
+  output=$(_gpull_one /tmp/example)
+  rc=$?
+  [[ $rc == $expected_rc && "$output" == *"$expected_text"* ]] || {
+    print -u2 "gpull misclassified $mode (rc=$rc): $output"
+    exit 1
+  }
+}
+
+check_probe no-main 1 'no local main — skipped'
+check_probe local-error 2 'could not inspect local main — failed'
+check_probe head-error 2 'could not inspect HEAD — failed'
+check_probe ancestry-error 2 'could not compare main with origin/main — failed'
+ZSH
+
+# A caller's ERR_EXIT option must not prevent safe-skip status artifacts from
+# being written by background workers.
+gpull_err_exit_base="$tmp/gpull-err-exit"
+mkdir -p "$gpull_err_exit_base/skipped/.git"
+set +e
+err_exit_output=$(
+  GPULL_SCRIPT="$gpull_script" \
+  GPULL_ERR_EXIT_BASE="$gpull_err_exit_base" \
+  zsh -f <<'ZSH' 2>&1
+typeset -g _GPULL_CODE_BASE="$GPULL_ERR_EXIT_BASE"
+typeset -g _GPULL_JOBS=1
+source "$GPULL_SCRIPT"
+_gpull_one() {
+  print -r -- "→ ${1:t}"
+  print -r -- '    no local main — skipped'
+  return 1
+}
+setopt err_exit
+gpull
+ZSH
+)
+err_exit_rc=$?
+set -e
+(( err_exit_rc == 0 )) || fail "ERR_EXIT changed a safe skip into failure: $err_exit_output"
+[[ "$err_exit_output" == *'0 ok  1 skipped  0 failed  (jobs=1)'* ]] ||
+  fail "ERR_EXIT lost the worker result: $err_exit_output"
+
+# Missing or unreadable worker artifacts always count as operational failures.
+gpull_artifact_base="$tmp/gpull-artifact-base"
+gpull_bad_artifacts="$tmp/gpull-bad-artifacts"
+mkdir -p "$gpull_artifact_base/repo/.git" "$gpull_bad_artifacts/0000.out"
+set +e
+artifact_output=$(
+  GPULL_SCRIPT="$gpull_script" \
+  GPULL_ARTIFACT_BASE="$gpull_artifact_base" \
+  GPULL_BAD_ARTIFACTS="$gpull_bad_artifacts" \
+  zsh -f <<'ZSH' 2>&1
+typeset -g _GPULL_CODE_BASE="$GPULL_ARTIFACT_BASE"
+typeset -g _GPULL_JOBS=1
+source "$GPULL_SCRIPT"
+mktemp() { print -r -- "$GPULL_BAD_ARTIFACTS"; }
+_gpull_one() { return 1; }
+gpull
+ZSH
+)
+artifact_rc=$?
+set -e
+(( artifact_rc != 0 )) || fail "gpull treated a missing output artifact as a safe skip"
+[[ "$artifact_output" == *'0 ok  0 skipped  1 failed  (jobs=1)'* ]] ||
+  fail "gpull did not fail closed for a missing output artifact: $artifact_output"
+
+# Scoped cleanup runs even when an inherited ERR_EXIT aborts the scheduler.
+gpull_cleanup_base="$tmp/gpull-cleanup-base"
+gpull_cleanup_tmp="$tmp/gpull-cleanup-tmp"
+mkdir -p "$gpull_cleanup_base/alpha/.git" "$gpull_cleanup_base/beta/.git" "$gpull_cleanup_tmp"
+set +e
+GPULL_SCRIPT="$gpull_script" \
+GPULL_CLEANUP_BASE="$gpull_cleanup_base" \
+GPULL_CLEANUP_TMP="$gpull_cleanup_tmp" \
+zsh -f <<'ZSH' >/dev/null 2>&1
+typeset -g _GPULL_CODE_BASE="$GPULL_CLEANUP_BASE"
+typeset -g _GPULL_JOBS=1
+source "$GPULL_SCRIPT"
+mktemp() { print -r -- "$GPULL_CLEANUP_TMP"; }
+sleep() { return 1; }
+_gpull_one() {
+  command sleep 0.2
+  print -r -- "→ ${1:t}"
+}
+setopt err_exit
+gpull
+ZSH
+cleanup_rc=$?
+set -e
+(( cleanup_rc != 0 )) || fail "gpull cleanup fixture did not trigger its early exit"
+[[ ! -e "$gpull_cleanup_tmp" ]] || fail "gpull left its temporary directory after early exit"
+
+# Full gpull behavior uses disposable local remotes: two updates, three safe
+# skips, and one operational failure that must make the aggregate command fail.
+gpull_code_base="$tmp/GpullCode"
+gpull_origin="$tmp/gpull-origin.git"
+gpull_seed="$tmp/gpull-seed"
+mkdir -p "$gpull_code_base" "$gpull_seed"
+GIT_CONFIG_GLOBAL=/dev/null git init --bare -q "$gpull_origin"
+GIT_CONFIG_GLOBAL=/dev/null git -C "$gpull_origin" symbolic-ref HEAD refs/heads/main
+GIT_CONFIG_GLOBAL=/dev/null git -C "$gpull_seed" init -q
+GIT_CONFIG_GLOBAL=/dev/null git -C "$gpull_seed" symbolic-ref HEAD refs/heads/main
+GIT_CONFIG_GLOBAL=/dev/null git -C "$gpull_seed" config user.name "Zsh Test"
+GIT_CONFIG_GLOBAL=/dev/null git -C "$gpull_seed" config user.email "zsh-test@example.invalid"
+printf 'base\n' > "$gpull_seed/file.txt"
+GIT_CONFIG_GLOBAL=/dev/null git -C "$gpull_seed" add file.txt
+GIT_CONFIG_GLOBAL=/dev/null git -C "$gpull_seed" commit -q -m "Initial gpull fixture"
+GIT_CONFIG_GLOBAL=/dev/null git -C "$gpull_seed" remote add origin "$gpull_origin"
+GIT_CONFIG_GLOBAL=/dev/null git -C "$gpull_seed" push -q -u origin main
+
+for name in clean-main dirty-main diverged no-main other-branch; do
+  GIT_CONFIG_GLOBAL=/dev/null git clone -q "$gpull_origin" "$gpull_code_base/$name"
+  GIT_CONFIG_GLOBAL=/dev/null git -C "$gpull_code_base/$name" config user.name "Zsh Test"
+  GIT_CONFIG_GLOBAL=/dev/null git -C "$gpull_code_base/$name" config user.email "zsh-test@example.invalid"
+done
+
+old_main=$(GIT_CONFIG_GLOBAL=/dev/null git -C "$gpull_code_base/clean-main" rev-parse main)
+GIT_CONFIG_GLOBAL=/dev/null git -C "$gpull_code_base/other-branch" checkout -q -b topic
+printf 'dirty\n' > "$gpull_code_base/dirty-main/untracked.txt"
+printf 'local\n' > "$gpull_code_base/diverged/local.txt"
+GIT_CONFIG_GLOBAL=/dev/null git -C "$gpull_code_base/diverged" add local.txt
+GIT_CONFIG_GLOBAL=/dev/null git -C "$gpull_code_base/diverged" commit -q -m "Local divergence"
+diverged_main=$(GIT_CONFIG_GLOBAL=/dev/null git -C "$gpull_code_base/diverged" rev-parse main)
+GIT_CONFIG_GLOBAL=/dev/null git -C "$gpull_code_base/no-main" branch -m trunk
+
+broken_repo="$gpull_code_base/broken-origin"
+mkdir -p "$broken_repo"
+GIT_CONFIG_GLOBAL=/dev/null git -C "$broken_repo" init -q
+GIT_CONFIG_GLOBAL=/dev/null git -C "$broken_repo" symbolic-ref HEAD refs/heads/main
+GIT_CONFIG_GLOBAL=/dev/null git -C "$broken_repo" config user.name "Zsh Test"
+GIT_CONFIG_GLOBAL=/dev/null git -C "$broken_repo" config user.email "zsh-test@example.invalid"
+printf 'broken\n' > "$broken_repo/file.txt"
+GIT_CONFIG_GLOBAL=/dev/null git -C "$broken_repo" add file.txt
+GIT_CONFIG_GLOBAL=/dev/null git -C "$broken_repo" commit -q -m "Broken origin fixture"
+GIT_CONFIG_GLOBAL=/dev/null git -C "$broken_repo" remote add origin "$tmp/missing-origin.git"
+
+printf 'remote\n' > "$gpull_seed/remote.txt"
+GIT_CONFIG_GLOBAL=/dev/null git -C "$gpull_seed" add remote.txt
+GIT_CONFIG_GLOBAL=/dev/null git -C "$gpull_seed" commit -q -m "Remote gpull update"
+GIT_CONFIG_GLOBAL=/dev/null git -C "$gpull_seed" push -q origin main
+remote_main=$(GIT_CONFIG_GLOBAL=/dev/null git -C "$gpull_seed" rev-parse main)
+
+set +e
+gpull_output=$(
+  GPULL_SCRIPT="$gpull_script" \
+  GPULL_CODE_BASE="$gpull_code_base" \
+  GIT_CONFIG_GLOBAL=/dev/null \
+  zsh -f <<'ZSH' 2>&1
+typeset -g _GPULL_CODE_BASE="$GPULL_CODE_BASE"
+typeset -g _GPULL_JOBS=3
+source "$GPULL_SCRIPT"
+gpull
+ZSH
+)
+gpull_rc=$?
+set -e
+
+(( gpull_rc != 0 )) || fail "gpull hid an operational failure"
+[[ "$gpull_output" == *'2 ok  3 skipped  1 failed  (jobs=3)'* ]] ||
+  fail "unexpected gpull summary: $gpull_output"
+[[ "$gpull_output" == *'dirty main — skipped'* ]] || fail "gpull did not report a dirty main"
+[[ "$gpull_output" == *'local main diverged from origin/main — skipped'* ]] ||
+  fail "gpull did not report divergence"
+[[ "$gpull_output" == *'fetch failed'* ]] || fail "gpull did not report a fetch failure"
+
+[[ "$(GIT_CONFIG_GLOBAL=/dev/null git -C "$gpull_code_base/clean-main" rev-parse main)" == "$remote_main" ]] ||
+  fail "gpull did not fast-forward checked-out main"
+[[ "$(GIT_CONFIG_GLOBAL=/dev/null git -C "$gpull_code_base/other-branch" rev-parse main)" == "$remote_main" ]] ||
+  fail "gpull did not update main from another branch"
+[[ "$(GIT_CONFIG_GLOBAL=/dev/null git -C "$gpull_code_base/other-branch" branch --show-current)" == topic ]] ||
+  fail "gpull switched the current branch"
+[[ "$(GIT_CONFIG_GLOBAL=/dev/null git -C "$gpull_code_base/dirty-main" rev-parse main)" == "$old_main" ]] ||
+  fail "gpull advanced a dirty checked-out main"
+[[ "$(GIT_CONFIG_GLOBAL=/dev/null git -C "$gpull_code_base/diverged" rev-parse main)" == "$diverged_main" ]] ||
+  fail "gpull rewrote a diverged main"
+if GIT_CONFIG_GLOBAL=/dev/null git -C "$gpull_code_base/no-main" show-ref --verify --quiet refs/heads/main; then
+  fail "gpull created a missing local main"
+fi
 
 # Worktree discovery, lifecycle, sync, and publication use disposable local repos.
 code_base="$tmp/Code"
