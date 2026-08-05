@@ -1,13 +1,15 @@
 # Zsh customizations
 
-These are sourced Zsh modules rather than standalone executables. Install either
-one independently or load both.
+These are sourced Zsh modules rather than standalone executables. Install any
+module independently or load all of them.
 
 ## Requirements
 
 - Zsh 5.x.
 - `caffeinate.zsh` is macOS-only and uses `/usr/bin/caffeinate` and
   `/usr/bin/pgrep`.
+- `gpull.zsh` requires Git. It expects repositories immediately below `~/Code`
+  to use the remote `origin` and branch `main`.
 - `worktrees.zsh` requires Git and uses
   [fzf](https://github.com/junegunn/fzf) for interactive pickers.
 - `wt open` and the picker's open action use the `code` CLI when available,
@@ -27,12 +29,13 @@ adapting before use.
 ### Oh My Zsh
 
 From this repository checkout, symlink the modules into the Oh My Zsh custom
-directory. Omit either link if you only want one module:
+directory. Omit any links for modules you do not want:
 
 ```bash
 custom_dir="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}"
 mkdir -p "$custom_dir"
 ln -s "$PWD/zsh/caffeinate.zsh" "$custom_dir/caffeinate.zsh"
+ln -s "$PWD/zsh/gpull.zsh" "$custom_dir/gpull.zsh"
 ln -s "$PWD/zsh/worktrees.zsh" "$custom_dir/worktrees.zsh"
 exec zsh
 ```
@@ -46,6 +49,7 @@ Source the modules from `.zshrc` using the checkout's absolute path:
 
 ```zsh
 source /absolute/path/to/public/zsh/caffeinate.zsh
+source /absolute/path/to/public/zsh/gpull.zsh
 source /absolute/path/to/public/zsh/worktrees.zsh
 ```
 
@@ -66,6 +70,35 @@ mode-`700` state directory; the PID file has mode `600`. Before signaling a PID 
 rejects unsafe state directories, symlinks, non-regular files, files owned by another
 user, stale PIDs, and processes whose name is not `caffeinate`. It does not stop
 `caffeinate` processes started by other tools because they are not in its PID file.
+
+## `gpull` repository sync
+
+`gpull` discovers Git repositories immediately below `~/Code`, fetches `origin`
+for each one concurrently, and fast-forwards its local `main` when that is safe.
+It prints repository results in directory order even though work runs in parallel.
+
+| Command | Behavior |
+| --- | --- |
+| `gpull` | Sync all discovered repositories with up to eight concurrent workers. |
+
+Set a different root or worker limit before sourcing the module:
+
+```zsh
+typeset -g _GPULL_CODE_BASE="$HOME/src"
+typeset -g _GPULL_JOBS=4
+source /absolute/path/to/public/zsh/gpull.zsh
+```
+
+A clean, checked-out `main` is fast-forwarded in place. When another branch (or
+a detached HEAD) is checked out, `gpull` advances the local `main` reference
+without switching branches. It safely skips dirty checked-out `main` branches,
+missing local `main` branches, and histories where local `main` is ahead of or
+diverged from `origin/main`. A skip does not make the aggregate command fail;
+an operational error such as a failed fetch does.
+
+`gpull` never pushes, stashes, resets, switches branches, creates `main`, or
+performs a non-fast-forward update. Its scope is intentionally shallow: nested
+repositories are not discovered.
 
 ## `wt` worktree workspaces
 
@@ -120,9 +153,9 @@ Picker keys:
 ## Test
 
 The local test checks syntax and command dispatch, validates `caf` without
-launching `caffeinate`, and exercises worktree discovery, removal, sync, and PR
-flows against disposable local repositories and a fake `gh` command. It makes no
-network requests:
+launching `caffeinate`, verifies `gpull` concurrency and safety against disposable
+local repositories, and exercises worktree discovery, removal, sync, and PR flows
+with a fake `gh` command. It makes no network requests:
 
 ```bash
 GIT_CONFIG_GLOBAL=/dev/null zsh/scripts/test-zsh.sh

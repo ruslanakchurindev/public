@@ -6,6 +6,8 @@ Small, self-contained command-line helpers and agent skills.
 
 - **[caffeinate](zsh/caffeinate.zsh)** — `caf` and `decaf` manage one tracked
   macOS `caffeinate` session, including optional durations in hours.
+- **[gpull](zsh/gpull.zsh)** — `gpull` concurrently fetches repositories under
+  `~/Code` and safely fast-forwards their local `main` branches.
 - **[worktrees](zsh/worktrees.zsh)** — `wt` discovers, creates, opens, syncs,
   removes, and publishes Git worktree-based workspaces.
 
