@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Reconcile agent skill links from the declarative manifest.
+#
+# Reads the manifest and, for each entry, symlinks the skill (absolute path)
+# into the appropriate targets:
+#   - user            -> every detected agent skills root
+#   - project:<repo>  -> <repo>/{.claude,.codex}/skills
+#
+# Idempotent and prune-safe: it records exactly which links it created (in a
+# machine-local state file) and, on the next run, removes only the links it
+# previously created that are no longer in the manifest. It never touches
+# skills it did not create (e.g. Codex's .system/, or anything dropped in by
+# hand).
+#
+# `sklink sync` runs this; it is also safe to call directly from a hook or a
+# cron job. Run with --print-roots to list the detected user-wide roots and
+# exit; `sklink doctor` uses that, so root detection lives in exactly one place.
+#
+# Environment:
+#   SKLINK_MANIFEST   manifest path (default: $XDG_CONFIG_HOME/sklink/manifest)
+#   SKLINK_ROOTS      space-separated user-wide roots, replacing autodetection
+#   XDG_CONFIG_HOME   default $HOME/.config
+#   XDG_STATE_HOME    default $HOME/.local/state
+
+self="${0##*/}"
+config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+manifest="${SKLINK_MANIFEST:-$config_home/sklink/manifest}"
+
+expand_tilde() { printf '%s' "${1/#\~/$HOME}"; }
+
+# --- discover user-wide agent skill roots ---
+# "<agent-home>|<skills-root>"; a root is used only if its agent home exists,
+# so installing or removing an agent needs no change here.
+default_candidates=(
+  "$HOME/.claude|$HOME/.claude/skills"
+  "$HOME/.codex|$HOME/.codex/skills"
+  "$HOME/.agents|$HOME/.agents/skills"
+)
+
+user_roots=()
+if [[ -n "${SKLINK_ROOTS:-}" ]]; then
+  IFS=': ' read -r -a user_roots <<< "$SKLINK_ROOTS"
+else
+  for cand in "${default_candidates[@]}"; do
+    home="${cand%%|*}"; root="${cand#*|}"
+    [[ -d "$home" ]] && user_roots+=("$root")
+  done
+fi
+
+# Single source of truth for root detection: `sklink doctor` shells out to this
+# instead of keeping its own copy of the list, which is how two copies of a list
+# drift apart. Answered before the manifest check — it needs no manifest.
+if [[ "${1:-}" == "--print-roots" ]]; then
+  for root in ${user_roots[@]+"${user_roots[@]}"}; do printf '%s\n' "$root"; done
+  exit 0
+fi
+
+if [[ ! -f "$manifest" ]]; then
+  printf '%s: manifest not found: %s\n' "$self" "$manifest" >&2
+  printf "%s: create one with 'sklink add <dir>', or set SKLINK_MANIFEST\\n" "$self" >&2
+  exit 1
+fi
+
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/sklink"
+state_file="$state_dir/managed.tsv"
+mkdir -p "$state_dir"
+
+# Per-repo subdirectories that receive project-scoped skills. Unlike the user
+# roots above these can't be auto-detected (an agent leaves no marker in a repo
+# it hasn't been used in yet), so the list is explicit.
+project_subdirs=(".claude/skills" ".codex/skills")
+
+status=0
+created=""   # accumulator, one "<root>\t<name>" per created link
+
+link_one() {
+  local root="$1" name="$2" src="$3"
+  local link_path="$root/$name"
+
+  if [[ ! -d "$src" ]]; then
+    printf 'warning: source not found for %s: %s\n' "$name" "$src" >&2
+    status=1
+    # A link we made earlier stays under management even though we can't
+    # refresh it now. Dropping it from the state file would orphan it: doctor
+    # would stop reporting it and a later `sklink rm` could never prune it.
+    [[ -L "$link_path" ]] && created+="$root	$name"$'\n'
+    return
+  fi
+  # One unwritable target must not abort the whole reconcile: under `set -e` a
+  # failed mkdir/ln used to kill the run before the prune and the state write,
+  # so a single permission error left the state file stale and every remaining
+  # entry unprocessed. Every failure below degrades to a warning + status=1.
+  if ! mkdir -p "$root" 2>/dev/null; then
+    printf 'warning: cannot create skills root: %s\n' "$root" >&2
+    status=1; return
+  fi
+  if [[ -e "$link_path" && ! -L "$link_path" ]]; then
+    printf 'refusing to replace non-symlink: %s\n' "$link_path" >&2
+    status=1; return
+  fi
+  # -n (BSD: -h) is what makes this safe to repeat: without it, ln follows an
+  # existing symlink-to-a-directory and drops the new link *inside* the skill
+  # folder instead of replacing the pointer.
+  if ! ln -sfn "$src" "$link_path" 2>/dev/null; then
+    printf 'warning: cannot link %s -> %s\n' "$link_path" "$src" >&2
+    status=1
+    [[ -L "$link_path" ]] && created+="$root	$name"$'\n'
+    return
+  fi
+  created+="$root	$name"$'\n'
+  printf '%s -> %s\n' "$link_path" "$src"
+}
+
+# --- parse manifest, create links ---
+while read -r scope name src _rest || [[ -n "${scope:-}" ]]; do
+  [[ -z "${scope:-}" ]] && continue
+  case "$scope" in \#*) continue;; esac
+  if [[ -z "${name:-}" || -z "${src:-}" ]]; then
+    printf 'skipping malformed manifest line near: %s %s\n' "$scope" "${name:-}" >&2
+    status=1; continue
+  fi
+  src="$(expand_tilde "$src")"
+
+  if [[ "$scope" == "user" ]]; then
+    # ${a[@]+"${a[@]}"}: an empty array under `set -u` is an error in bash 3.2,
+    # and "no agent installed yet" must be a no-op, not a crash.
+    for root in ${user_roots[@]+"${user_roots[@]}"}; do link_one "$root" "$name" "$src"; done
+  elif [[ "$scope" == project:* ]]; then
+    repo="$(expand_tilde "${scope#project:}")"
+    # Without this guard a stale scope (a repo since renamed or deleted) would
+    # be silently conjured back into existence by the mkdir -p in link_one,
+    # leaving a phantom repo containing nothing but .claude/skills.
+    if [[ ! -d "$repo" ]]; then
+      printf 'warning: project repo not found for %s: %s\n' "$name" "$repo" >&2
+      status=1; continue
+    fi
+    for sub in "${project_subdirs[@]}"; do link_one "$repo/$sub" "$name" "$src"; done
+  else
+    printf 'unknown scope "%s" for %s\n' "$scope" "$name" >&2
+    status=1
+  fi
+done < "$manifest"
+
+# --- prune links we created previously but no longer want ---
+if [[ -f "$state_file" ]]; then
+  while IFS=$'\t' read -r root name; do
+    [[ -z "${root:-}" || -z "${name:-}" ]] && continue
+    if ! printf '%s' "$created" | grep -qxF "$root	$name"; then
+      if [[ -L "$root/$name" ]]; then
+        rm -f "$root/$name"
+        printf 'pruned %s/%s\n' "$root" "$name"
+      fi
+    fi
+  done < "$state_file"
+fi
+
+# --- persist what we manage now ---
+printf '%s' "$created" > "$state_file"
+
+exit "$status"

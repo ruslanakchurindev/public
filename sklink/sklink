@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Manage the curated skill registry. See usage() below for the commands.
+#
+# The manifest is the source of truth; every command that changes it re-syncs
+# automatically by calling the reconciler (sklink-sync) that sits beside this
+# script.
+#
+# This script is meant to be invoked through a symlink on PATH, so it never
+# hardcodes its own name: every message derives it from $0. Rename the symlink
+# and the tool renames itself.
+#
+# Environment:
+#   SKLINK_MANIFEST   manifest path (default: $XDG_CONFIG_HOME/sklink/manifest)
+#   SKLINK_ROOTS      space-separated user-wide roots, replacing autodetection
+#   XDG_CONFIG_HOME   default $HOME/.config
+#   XDG_STATE_HOME    default $HOME/.local/state
+
+# Resolve this script's real location, following symlinks. This matters because
+# the CLI is meant to be installed on PATH as a symlink (e.g. ~/.local/bin/sklink
+# -> /path/to/sklink/sklink). BASH_SOURCE[0] holds the symlink path, not the
+# target, so a naive dirname would look for the reconciler in ~/.local/bin.
+# Walk the symlink chain (portable: plain readlink, bash 3.2 / BSD safe).
+_src="${BASH_SOURCE[0]}"
+while [ -L "$_src" ]; do
+  _dir="$(cd -P "$(dirname "$_src")" && pwd)"
+  _src="$(readlink "$_src")"
+  case "$_src" in /*) ;; *) _src="$_dir/$_src";; esac
+done
+linker="$(cd -P "$(dirname "$_src")" && pwd)/sklink-sync"
+
+config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+manifest="${SKLINK_MANIFEST:-$config_home/sklink/manifest}"
+
+self="${0##*/}"
+die() { printf '%s: %s\n' "$self" "$*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+$self — link agent skills into every AI agent on the machine.
+
+  $self list                       show the manifest
+  $self sync                       reconcile all agent links
+  $self add <dir> [--user|--project <repo>] [--name <n>]
+  $self rm  <name> [--scope <scope>]
+  $self doctor                     report drift / dangling links
+
+The manifest is the source of truth; every command that changes it re-syncs
+automatically. It lives at
+  $manifest
+and its location can be overridden with SKLINK_MANIFEST.
+EOF
+}
+
+expand_tilde() { printf '%s' "${1/#\~/$HOME}"; }
+collapse_home() { printf '%s' "${1/#$HOME/~}"; }
+
+# Follow a symlink chain to the real file. Rewriting the manifest with
+# `mv tmp $manifest` would otherwise replace the symlink itself with a regular
+# file, silently splitting a manifest that lives in a repo and is linked into
+# the config dir — the real file keeps the stale content and nothing reports it.
+# Portable: plain readlink, bash 3.2 / BSD safe.
+resolve_symlink() {
+  local p="$1" d
+  while [ -L "$p" ]; do
+    d="$(cd -P "$(dirname "$p")" && pwd)"
+    p="$(readlink "$p")"
+    case "$p" in /*) ;; *) p="$d/$p";; esac
+  done
+  printf '%s' "$p"
+}
+
+# Read commands fail loud rather than letting downstream greps emit a confusing
+# "No such file or directory" against a phantom path. --help must keep working
+# without a manifest, so this is per-command rather than at load time.
+require_manifest() {
+  [[ -f "$manifest" ]] && return 0
+  printf '%s: manifest not found: %s\n' "$self" "$manifest" >&2
+  printf "%s: create one with '%s add <dir>', or set SKLINK_MANIFEST\\n" "$self" "$self" >&2
+  exit 1
+}
+
+# `add` is the one command that may create the manifest: it is how a fresh
+# install gets its first entry, and "manifest not found" would otherwise be a
+# dead end. The header is the format documentation, written once, at the top of
+# the user's own file.
+ensure_manifest() {
+  [[ -f "$manifest" ]] && return 0
+  mkdir -p "$(dirname "$manifest")" || die "cannot create $(dirname "$manifest")"
+  cat > "$manifest" <<'EOF'
+# Skill registry — single source of truth for where each skill is linked.
+#
+# Format (whitespace-separated):
+#   <scope>   <name>   <source-dir>
+#
+# scope:
+#   user              -> linked into every detected agent (Claude, Codex, .agents)
+#   project:<repo>    -> linked into <repo>/.claude/skills and <repo>/.codex/skills
+# source-dir: the real skill directory (must contain SKILL.md). ~ is expanded.
+#
+# Reconcile after editing:  sklink sync
+# Add without hand-editing: sklink add <source-dir> --user | --project <repo>
+EOF
+  printf 'created manifest: %s\n' "$manifest"
+}
+
+skill_name_for() {
+  local dir="$1" name
+  name="$(awk '
+    NR==1 && $0=="---"{fm=1; next}
+    fm && $0=="---"{exit}
+    fm && $0 ~ /^name:[[:space:]]*/ { sub(/^name:[[:space:]]*/,""); print; exit }
+  ' "$dir/SKILL.md" 2>/dev/null)"
+  [[ -z "$name" ]] && name="$(basename "$dir")"
+  name="${name%\"}"; name="${name#\"}"; name="${name%\'}"; name="${name#\'}"
+  printf '%s' "$name"
+}
+
+cmd_list() {
+  require_manifest
+  printf '# %s\n\n' "$manifest"
+  grep -vE '^[[:space:]]*(#|$)' "$manifest" | awk '{printf "  %-30s %-16s %s\n", $1, $2, $3}'
+}
+
+cmd_sync() { require_manifest; SKLINK_MANIFEST="$manifest" bash "$linker"; }
+
+cmd_add() {
+  local dir="" scope="user" name=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --user) scope="user"; shift;;
+      --project) [[ -n "${2:-}" ]] || die "--project needs a repo path"
+                 scope="project:$(collapse_home "$(cd "$(expand_tilde "$2")" && pwd)")"; shift 2;;
+      --name) name="${2:-}"; shift 2;;
+      -*) die "unknown flag: $1";;
+      *) dir="$1"; shift;;
+    esac
+  done
+  [[ -n "$dir" ]] || die "usage: $self add <dir> [--user|--project <repo>] [--name <n>]"
+  local abs; abs="$(cd "$(expand_tilde "$dir")" 2>/dev/null && pwd)" || die "no such dir: $dir"
+  [[ -f "$abs/SKILL.md" ]] || die "no SKILL.md in $abs"
+  [[ -n "$name" ]] || name="$(skill_name_for "$abs")"
+
+  ensure_manifest
+  if awk -v s="$scope" -v n="$name" '$1==s && $2==n {f=1} END{exit f?0:1}' "$manifest"; then
+    die "already registered: $scope $name (edit $manifest or '$self rm' first)"
+  fi
+  # Guarantee a line break before appending: a manifest whose last line has no
+  # trailing newline (hand-edited ones often don't) would otherwise get the new
+  # entry glued onto the end of the previous one.
+  [[ -s "$manifest" && -n "$(tail -c 1 "$manifest")" ]] && printf '\n' >> "$manifest"
+  printf '%s  %s  %s\n' "$scope" "$name" "$(collapse_home "$abs")" >> "$manifest"
+  printf 'added: %s  %s  %s\n' "$scope" "$name" "$(collapse_home "$abs")"
+  cmd_sync
+}
+
+cmd_rm() {
+  local name="" scope=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --scope) scope="${2:-}"; shift 2;;
+      -*) die "unknown flag: $1";;
+      *) name="$1"; shift;;
+    esac
+  done
+  [[ -n "$name" ]] || die "usage: $self rm <name> [--scope <scope>]"
+  require_manifest
+  local target; target="$(resolve_symlink "$manifest")"
+  # Bare `mktemp` on macOS ignores TMPDIR in favour of the Darwin per-user temp
+  # dir, so it fails outright wherever that dir isn't writable (sandboxes, some
+  # CI). Give it an explicit template rooted in TMPDIR.
+  local tmp; tmp="$(mktemp "${TMPDIR:-/tmp}/sklink-manifest.XXXXXX")" || die "cannot create temp file"
+  awk -v n="$name" -v s="$scope" '
+    /^[[:space:]]*(#|$)/ { print; next }
+    { if ($2==n && (s=="" || $1==s)) { removed++; next } print }
+    END { if (!removed) exit 3 }
+  ' "$target" > "$tmp" || { rm -f "$tmp"; die "no manifest entry named: $name${scope:+ (scope $scope)}"; }
+  # Carry the real file's permissions across: mktemp creates 0600 and mv keeps
+  # that mode, quietly tightening a manifest that was group- or world-readable.
+  # stat is spelled differently on BSD and GNU; a failure here is not fatal.
+  local mode; mode="$(stat -f '%Lp' "$target" 2>/dev/null || stat -c '%a' "$target" 2>/dev/null || true)"
+  [[ -n "$mode" ]] && chmod "$mode" "$tmp" 2>/dev/null || true
+  mv "$tmp" "$target"
+  printf 'removed %s from manifest\n' "$name"
+  cmd_sync
+}
+
+cmd_doctor() {
+  require_manifest
+  local state="${XDG_STATE_HOME:-$HOME/.local/state}/sklink/managed.tsv"
+  printf '== manifest ==\n  %s\n' "$manifest"
+  printf '\n== detected user roots ==\n'
+  # Ask the reconciler rather than re-deriving the list here — a second copy drifts.
+  bash "$linker" --print-roots | sed 's/^/  /'
+  printf '\n== manifest sources ==\n'
+  grep -vE '^[[:space:]]*(#|$)' "$manifest" | while read -r scope name src _; do
+    src="$(expand_tilde "$src")"
+    if [[ -f "$src/SKILL.md" ]]; then printf '  ok    %-16s %s\n' "$name" "$src"
+    else printf '  BAD   %-16s %s (missing SKILL.md)\n' "$name" "$src"; fi
+  done
+  printf '\n== managed links ==\n'
+  if [[ -f "$state" ]]; then
+    while IFS=$'\t' read -r root name; do
+      [[ -z "${root:-}" ]] && continue
+      if [[ -L "$root/$name" && -e "$root/$name" ]]; then printf '  ok    %s/%s\n' "$root" "$name"
+      elif [[ -L "$root/$name" ]]; then printf '  DANGLING %s/%s\n' "$root" "$name"
+      else printf '  MISSING  %s/%s\n' "$root" "$name"; fi
+    done < "$state"
+  else printf '  (no state yet — run: %s sync)\n' "$self"; fi
+}
+
+sub="${1:-}"; [[ $# -gt 0 ]] && shift || true
+case "$sub" in
+  list)   cmd_list "$@";;
+  sync)   cmd_sync "$@";;
+  add)    cmd_add "$@";;
+  rm)     cmd_rm "$@";;
+  doctor) cmd_doctor "$@";;
+  ""|-h|--help|help) usage;;
+  *) die "unknown command: $sub (try: $self --help)";;
+esac
