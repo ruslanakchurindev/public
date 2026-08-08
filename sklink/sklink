@@ -5,17 +5,23 @@ set -euo pipefail
 #
 # The manifest is the source of truth; every command that changes it re-syncs
 # automatically by calling the reconciler (sklink-sync) that sits beside this
-# script.
+# script. Link derivation lives there, not here: `doctor` asks it what the links
+# should be (--print-plan / --print-roots) rather than keeping a second copy of
+# the rules that would drift.
 #
 # This script is meant to be invoked through a symlink on PATH, so it never
 # hardcodes its own name: every message derives it from $0. Rename the symlink
-# and the tool renames itself.
+# and the tool renames itself — including the manifest template it writes.
 #
 # Environment:
 #   SKLINK_MANIFEST   manifest path (default: $XDG_CONFIG_HOME/sklink/manifest)
 #   SKLINK_ROOTS      space-separated user-wide roots, replacing autodetection
 #   XDG_CONFIG_HOME   default $HOME/.config
 #   XDG_STATE_HOME    default $HOME/.local/state
+#   EDITOR / VISUAL   used by `edit`
+#   NO_COLOR          set to disable colour
+
+version="0.1.0"
 
 # Resolve this script's real location, following symlinks. This matters because
 # the CLI is meant to be installed on PATH as a symlink (e.g. ~/.local/bin/sklink
@@ -28,29 +34,76 @@ while [ -L "$_src" ]; do
   _src="$(readlink "$_src")"
   case "$_src" in /*) ;; *) _src="$_dir/$_src";; esac
 done
-linker="$(cd -P "$(dirname "$_src")" && pwd)/sklink-sync"
+tool_dir="$(cd -P "$(dirname "$_src")" && pwd)"
+linker="$tool_dir/sklink-sync"
+template="$tool_dir/templates/manifest"
 
 config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
 manifest="${SKLINK_MANIFEST:-$config_home/sklink/manifest}"
 
 self="${0##*/}"
-die() { printf '%s: %s\n' "$self" "$*" >&2; exit 1; }
+
+# Colour is presentation only: every escape is defined here and nowhere else.
+# stdout and stderr are decided separately because `sklink list | less` still
+# has a terminal on stderr. (Duplicated in sklink-sync on purpose — each script
+# has to stand alone.)
+if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-}" != "dumb" ]]; then
+  c_bold=$'\033[1m'; c_dim=$'\033[2m'; c_red=$'\033[31m'; c_green=$'\033[32m'; c_yellow=$'\033[33m'; c_off=$'\033[0m'
+else
+  c_bold=""; c_dim=""; c_red=""; c_green=""; c_yellow=""; c_off=""
+fi
+if [[ -t 2 && -z "${NO_COLOR:-}" && "${TERM:-}" != "dumb" ]]; then
+  e_err=$'\033[31m'; e_dim=$'\033[2m'; e_off=$'\033[0m'
+else
+  e_err=""; e_dim=""; e_off=""
+fi
+
+die() { printf '%s%s:%s %s\n' "$e_err" "$self" "$e_off" "$*" >&2; exit 1; }
+# Second line of an error: what to do about it. Dim, so the error stays the
+# thing you read first.
+hint() { printf '%s  %s%s\n' "$e_dim" "$*" "$e_off" >&2; return 0; }
+plural() { [[ "$1" == 1 ]] || printf 's'; return 0; }
+in_list() { local needle="$1" x; shift; for x in "$@"; do [[ "$x" == "$needle" ]] && return 0; done; return 1; }
 
 usage() {
   cat <<EOF
-$self — link agent skills into every AI agent on the machine.
+$self — link one copy of each agent skill into every AI agent on this machine.
 
-  $self list                       show the manifest
-  $self sync                       reconcile all agent links
-  $self add <dir> [--user|--project <repo>] [--name <n>]
-  $self rm  <name> [--scope <scope>]
-  $self doctor                     report drift / dangling links
+commands
+  $self list                     what is registered, and where it comes from
+  $self add <dir> [--user | --project <repo>] [--name <name>]
+  $self rm <name> [--scope <scope>]
+  $self sync [-n] [-v] [-q]      make the links match the manifest
+  $self doctor                   check sources, links and drift
+  $self edit                     open the manifest in \$EDITOR, then sync
+  $self init                     create the manifest (never overwrites)
+  $self --help | --version
 
-The manifest is the source of truth; every command that changes it re-syncs
-automatically. It lives at
-  $manifest
-and its location can be overridden with SKLINK_MANIFEST.
+sync options
+  -n, --dry-run   report what would change, change nothing
+  -v, --verbose   list every link, not just the ones that changed
+  -q, --quiet     print nothing but warnings
+
+the manifest
+  $(collapse_home "$manifest")$(manifest_status)
+  The source of truth: every command that changes it re-syncs for you, and
+  hand-editing it plus \`$self sync\` is equally supported.
+
+environment
+  SKLINK_MANIFEST   where the registry lives
+  SKLINK_ROOTS      user-wide skill roots, replacing detection
+  EDITOR / VISUAL   used by \`$self edit\`
+  NO_COLOR          disable colour
 EOF
+}
+
+# Shown in --help: whether the file behind that path is actually there yet is
+# the first thing a new user needs to know about it.
+manifest_status() {
+  local n
+  if [[ ! -f "$manifest" ]]; then printf '  (not created yet — run: %s init)' "$self"; return 0; fi
+  n="$(manifest_count)"
+  printf '  (%s skill%s)' "$n" "$(plural "$n")"
 }
 
 expand_tilde() { printf '%s' "${1/#\~/$HOME}"; }
@@ -67,6 +120,10 @@ collapse_home() {
   fi
 }
 
+# Normalise a manifest path for display: `~/x` and `/home/you/x` should look the
+# same in a report, whichever form the file happens to use.
+show_path() { collapse_home "$(expand_tilde "$1")"; }
+
 # Follow a symlink chain to the real file. Rewriting the manifest with
 # `mv tmp $manifest` would otherwise replace the symlink itself with a regular
 # file, silently splitting a manifest that lives in a repo and is linked into
@@ -82,38 +139,74 @@ resolve_symlink() {
   printf '%s' "$p"
 }
 
+# Counts what the reconciler would call an entry — three fields, not a comment —
+# so a half-written line is reported as a problem instead of padding the total.
+manifest_count() {
+  [[ -f "$manifest" ]] || { printf '0'; return 0; }
+  awk '!/^[[:space:]]*(#|$)/ && NF>=3 {n++} END{print n+0}' "$manifest" 2>/dev/null || printf '0'
+}
+
+# A manifest path that exists as a broken symlink is neither there nor safe to
+# create: writing would replace the link itself and silently detach it from the
+# file it pointed at — typically a manifest kept in a repo.
+manifest_broken_link() { [[ -L "$manifest" && ! -e "$manifest" ]]; }
+
 # Read commands fail loud rather than letting downstream greps emit a confusing
 # "No such file or directory" against a phantom path. --help must keep working
 # without a manifest, so this is per-command rather than at load time.
 require_manifest() {
   [[ -f "$manifest" ]] && return 0
-  printf '%s: manifest not found: %s\n' "$self" "$manifest" >&2
-  printf "%s: create one with '%s add <dir>', or set SKLINK_MANIFEST\\n" "$self" "$self" >&2
+  printf '%s%s:%s manifest not found: %s\n' "$e_err" "$self" "$e_off" "$manifest" >&2
+  hint "create one with '$self init', add a skill with '$self add <dir>',"
+  hint "or point SKLINK_MANIFEST at the one you already have"
   exit 1
+}
+
+# The manifest is written from a template that ships with the tool, so the
+# format documentation a user finds at the top of their own file is the same
+# text we maintain in the repo — and @CMD@ becomes whatever this command is
+# actually called. An existing manifest is never touched: it is user data.
+write_template() {
+  local dir tmp line
+  dir="$(dirname "$manifest")"
+  [[ -f "$template" ]] || die "missing template: $template (incomplete checkout?)"
+  mkdir -p "$dir" || die "cannot create $dir"
+  tmp="$(mktemp "${TMPDIR:-/tmp}/sklink-manifest.XXXXXX")" || die "cannot create temp file"
+  # Substituted in bash rather than sed/awk: the command name is data, and a
+  # replacement string is exactly where an unescaped & or \ would bite.
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    printf '%s\n' "${line//@CMD@/$self}"
+  done < "$template" > "$tmp"
+  mv "$tmp" "$manifest" || { rm -f "$tmp"; die "cannot write $manifest"; }
+}
+
+cmd_init() {
+  if manifest_broken_link; then
+    die "manifest is a broken symlink: $manifest -> $(readlink "$manifest")"
+  fi
+  if [[ -e "$manifest" ]]; then
+    local n; n="$(manifest_count)"
+    printf '%smanifest already exists%s  %s%s%s  %s(%s skill%s — left untouched)%s\n' \
+      "$c_bold" "$c_off" "$c_dim" "$(show_path "$manifest")" "$c_off" \
+      "$c_dim" "$n" "$(plural "$n")" "$c_off"
+    return 0
+  fi
+  write_template
+  # No "next step" line here: the installer prints its own, and `list` on the
+  # empty registry it just made already shows exactly what to type.
+  printf '%screated manifest%s  %s%s%s\n' "$c_bold" "$c_off" "$c_dim" "$(show_path "$manifest")" "$c_off"
 }
 
 # `add` is the one command that may create the manifest: it is how a fresh
 # install gets its first entry, and "manifest not found" would otherwise be a
-# dead end. The header is the format documentation, written once, at the top of
-# the user's own file.
+# dead end.
 ensure_manifest() {
   [[ -f "$manifest" ]] && return 0
-  mkdir -p "$(dirname "$manifest")" || die "cannot create $(dirname "$manifest")"
-  cat > "$manifest" <<'EOF'
-# Skill registry — single source of truth for where each skill is linked.
-#
-# Format (whitespace-separated):
-#   <scope>   <name>   <source-dir>
-#
-# scope:
-#   user              -> linked into every detected agent (Claude, Codex, .agents)
-#   project:<repo>    -> linked into <repo>/.claude/skills and <repo>/.codex/skills
-# source-dir: the real skill directory (must contain SKILL.md). ~ is expanded.
-#
-# Reconcile after editing:  sklink sync
-# Add without hand-editing: sklink add <source-dir> --user | --project <repo>
-EOF
-  printf 'created manifest: %s\n' "$manifest"
+  if manifest_broken_link; then
+    die "manifest is a broken symlink: $manifest -> $(readlink "$manifest")"
+  fi
+  write_template
+  printf '%screated manifest%s  %s%s%s\n' "$c_bold" "$c_off" "$c_dim" "$(show_path "$manifest")" "$c_off"
 }
 
 skill_name_for() {
@@ -128,41 +221,179 @@ skill_name_for() {
   printf '%s' "$name"
 }
 
+# --- list -------------------------------------------------------------------
+# Grouped by scope (user first, then each project in the order it first appears)
+# and aligned to the longest name, because a registry is read far more often
+# than it is written. Order inside a group is manifest order, so what you see
+# still maps line-for-line onto the file you may be hand-editing.
 cmd_list() {
   require_manifest
-  printf '# %s\n\n' "$manifest"
-  grep -vE '^[[:space:]]*(#|$)' "$manifest" | awk '{printf "  %-30s %-16s %s\n", $1, $2, $3}'
+  local scopes=() names=() srcs=()
+  local scope name src rest total i g w=8 n_user=0 n_proj=0 malformed=0 missing=0
+
+  while read -r scope name src rest || [[ -n "${scope:-}" ]]; do
+    [[ -z "${scope:-}" ]] && continue
+    case "$scope" in \#*) continue;; esac
+    if [[ -z "${name:-}" || -z "${src:-}" ]]; then malformed=$((malformed + 1)); continue; fi
+    scopes+=("$scope"); names+=("$name"); srcs+=("$src")
+  done < "$manifest"
+
+  total=${#names[@]}
+  if [[ "$total" == 0 ]]; then
+    printf '%sno skills registered yet%s  %s%s%s\n\n' \
+      "$c_bold" "$c_off" "$c_dim" "$(show_path "$manifest")" "$c_off"
+    printf '  %s add <skill-dir> --user            %s# every agent on this machine%s\n' "$self" "$c_dim" "$c_off"
+    printf '  %s add <skill-dir> --project <repo>  %s# one repo only%s\n' "$self" "$c_dim" "$c_off"
+    return 0
+  fi
+
+  for ((i = 0; i < total; i++)); do
+    if [[ ${#names[$i]} -gt $w ]]; then w=${#names[$i]}; fi
+    case "${scopes[$i]}" in
+      user)      n_user=$((n_user + 1));;
+      project:*) n_proj=$((n_proj + 1));;
+    esac
+  done
+  # One pathological name must not push every path off the right edge.
+  if [[ $w -gt 28 ]]; then w=28; fi
+
+  local breakdown=""
+  if [[ "$n_user" -gt 0 && "$n_proj" -gt 0 ]]; then breakdown="  ($n_user user, $n_proj project)"; fi
+  printf '%s%s skill%s%s%s%s%s  %s%s%s\n' \
+    "$c_bold" "$total" "$(plural "$total")" "$c_off" \
+    "$c_dim" "$breakdown" "$c_off" \
+    "$c_dim" "$(show_path "$manifest")" "$c_off"
+
+  # `user` first when present, then every other scope in first-appearance order.
+  local groups=()
+  for ((i = 0; i < total; i++)); do
+    if [[ "${scopes[$i]}" == "user" ]]; then groups=("user"); break; fi
+  done
+  for ((i = 0; i < total; i++)); do
+    if ! in_list "${scopes[$i]}" ${groups[@]+"${groups[@]}"}; then groups+=("${scopes[$i]}"); fi
+  done
+
+  for g in "${groups[@]}"; do
+    printf '\n'
+    case "$g" in
+      user)
+        printf '%suser%s  %severy agent on this machine%s\n' "$c_bold" "$c_off" "$c_dim" "$c_off";;
+      project:*)
+        local repo="${g#project:}"
+        if [[ -d "$(expand_tilde "$repo")" ]]; then
+          printf '%sproject%s  %s\n' "$c_bold" "$c_off" "$(show_path "$repo")"
+        else
+          printf '%sproject%s  %s  %srepo not found%s\n' "$c_bold" "$c_off" "$(show_path "$repo")" "$c_red" "$c_off"
+          missing=$((missing + 1))
+        fi;;
+      *)
+        printf '%s%s%s  %sunknown scope — sync will skip it%s\n' "$c_red" "$g" "$c_off" "$c_red" "$c_off"
+        missing=$((missing + 1));;
+    esac
+    for ((i = 0; i < total; i++)); do
+      [[ "${scopes[$i]}" == "$g" ]] || continue
+      if [[ -d "$(expand_tilde "${srcs[$i]}")" ]]; then
+        printf '  %-*s  %s%s%s\n' "$w" "${names[$i]}" "$c_dim" "$(show_path "${srcs[$i]}")" "$c_off"
+      else
+        printf '  %-*s  %s%s%s  %ssource missing%s\n' \
+          "$w" "${names[$i]}" "$c_dim" "$(show_path "${srcs[$i]}")" "$c_off" "$c_red" "$c_off"
+        missing=$((missing + 1))
+      fi
+    done
+  done
+
+  if [[ "$malformed" -gt 0 ]]; then
+    printf '\n%s%s malformed line%s skipped — a line is: <scope> <name> <source-dir>%s\n' \
+      "$c_red" "$malformed" "$(plural "$malformed")" "$c_off"
+  fi
+  if [[ "$missing" -gt 0 || "$malformed" -gt 0 ]]; then
+    printf '%srun '\''%s doctor'\'' for the details%s\n' "$c_dim" "$self" "$c_off"
+  fi
+  return 0
 }
 
-cmd_sync() { require_manifest; SKLINK_MANIFEST="$manifest" bash "$linker"; }
+cmd_sync() { require_manifest; SKLINK_MANIFEST="$manifest" bash "$linker" "$@"; }
+
+cmd_edit() {
+  ensure_manifest
+  local target editor before after
+  # Edit the real file, not the symlink: $EDITOR replacing the file in place
+  # would otherwise turn a manifest kept in a repo into a local copy.
+  target="$(resolve_symlink "$manifest")"
+  editor="${VISUAL:-${EDITOR:-vi}}"
+  command -v "${editor%% *}" >/dev/null 2>&1 || die "editor not found: ${editor%% *} (set \$EDITOR)"
+  before="$(cksum < "$target")"
+  # Unquoted on purpose: $EDITOR may carry arguments, e.g. "code --wait".
+  $editor "$target"
+  after="$(cksum < "$target")"
+  if [[ "$before" == "$after" ]]; then
+    printf '%sno changes%s\n' "$c_dim" "$c_off"
+    return 0
+  fi
+  cmd_sync
+}
 
 cmd_add() {
-  local dir="" scope="user" name=""
+  local dir="" scope="user" name="" repo=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --user) scope="user"; shift;;
-      --project) [[ -n "${2:-}" ]] || die "--project needs a repo path"
-                 scope="project:$(collapse_home "$(cd "$(expand_tilde "$2")" && pwd)")"; shift 2;;
-      --name) name="${2:-}"; shift 2;;
+      --project)
+        [[ -n "${2:-}" ]] || die "--project needs a repo path"
+        repo="$(cd "$(expand_tilde "$2")" 2>/dev/null && pwd)" \
+          || die "no such repo: $2"
+        scope="project:$(collapse_home "$repo")"; shift 2;;
+      --name) [[ -n "${2:-}" ]] || die "--name needs a value"; name="$2"; shift 2;;
+      -h|--help) usage; return 0;;
       -*) die "unknown flag: $1";;
-      *) dir="$1"; shift;;
+      *) [[ -z "$dir" ]] || die "one directory at a time (got '$dir' and '$1')"
+         dir="$1"; shift;;
     esac
   done
-  [[ -n "$dir" ]] || die "usage: $self add <dir> [--user|--project <repo>] [--name <n>]"
-  local abs; abs="$(cd "$(expand_tilde "$dir")" 2>/dev/null && pwd)" || die "no such dir: $dir"
-  [[ -f "$abs/SKILL.md" ]] || die "no SKILL.md in $abs"
+  if [[ -z "$dir" ]]; then
+    printf '%s%s:%s usage: %s add <dir> [--user|--project <repo>] [--name <n>]\n' "$e_err" "$self" "$e_off" "$self" >&2
+    hint "<dir> is the one real copy of the skill — the folder holding SKILL.md"
+    exit 1
+  fi
+
+  local abs
+  abs="$(cd "$(expand_tilde "$dir")" 2>/dev/null && pwd)" || die "no such directory: $dir"
+  if [[ ! -f "$abs/SKILL.md" ]]; then
+    printf '%s%s:%s not a skill: %s\n' "$e_err" "$self" "$e_off" "$(show_path "$abs")" >&2
+    hint "a skill is a directory with a SKILL.md at its root"
+    exit 1
+  fi
   [[ -n "$name" ]] || name="$(skill_name_for "$abs")"
+
+  # The manifest is whitespace-separated, so a space anywhere in an entry would
+  # be written out and read back as a different (or truncated) path. Refuse
+  # rather than record something that silently links the wrong directory.
+  case "$abs" in *[[:space:]]*) die "source path contains whitespace, which the manifest cannot represent: $abs";; esac
+  case "$name" in *[[:space:]]*) die "name contains whitespace: '$name' (pass --name to choose another)";; esac
+  case "$name" in \#*) die "name cannot start with # (that is a comment in the manifest): '$name'";; esac
+
+  # A name that disagrees with the skill's own frontmatter is exactly the drift
+  # doctor exists to catch, so say so now instead of a week from now.
+  local declared; declared="$(skill_name_for "$abs")"
+  if [[ "$name" != "$declared" ]]; then
+    printf '%snote:%s registering as "%s", but its SKILL.md says "%s"\n' "$c_yellow" "$c_off" "$name" "$declared"
+  fi
 
   ensure_manifest
   if awk -v s="$scope" -v n="$name" '$1==s && $2==n {f=1} END{exit f?0:1}' "$manifest"; then
-    die "already registered: $scope $name (edit $manifest or '$self rm' first)"
+    printf '%s%s:%s already registered: %s %s\n' "$e_err" "$self" "$e_off" "$scope" "$name" >&2
+    hint "change it with '$self rm $name --scope $scope' first, or edit $(show_path "$manifest")"
+    exit 1
   fi
+  local target; target="$(resolve_symlink "$manifest")"
   # Guarantee a line break before appending: a manifest whose last line has no
   # trailing newline (hand-edited ones often don't) would otherwise get the new
   # entry glued onto the end of the previous one.
-  [[ -s "$manifest" && -n "$(tail -c 1 "$manifest")" ]] && printf '\n' >> "$manifest"
-  printf '%s  %s  %s\n' "$scope" "$name" "$(collapse_home "$abs")" >> "$manifest"
-  printf 'added: %s  %s  %s\n' "$scope" "$name" "$(collapse_home "$abs")"
+  [[ -s "$target" && -n "$(tail -c 1 "$target")" ]] && printf '\n' >> "$target"
+  printf '%s  %s  %s\n' "$scope" "$name" "$(collapse_home "$abs")" >> "$target"
+
+  printf '%sadded%s  %s  %s%s%s  %s(%s)%s\n' \
+    "$c_green" "$c_off" "$name" "$c_dim" "$(collapse_home "$abs")" "$c_off" "$c_dim" "$scope" "$c_off"
   cmd_sync
 }
 
@@ -170,68 +401,256 @@ cmd_rm() {
   local name="" scope=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --scope) scope="${2:-}"; shift 2;;
+      --scope) [[ -n "${2:-}" ]] || die "--scope needs a value"; scope="$2"; shift 2;;
+      -h|--help) usage; return 0;;
       -*) die "unknown flag: $1";;
-      *) name="$1"; shift;;
+      *) [[ -z "$name" ]] || die "one name at a time (got '$name' and '$1')"
+         name="$1"; shift;;
     esac
   done
   [[ -n "$name" ]] || die "usage: $self rm <name> [--scope <scope>]"
   require_manifest
   local target; target="$(resolve_symlink "$manifest")"
+
+  # Look before removing, so the report names what actually went — `rm foo`
+  # with no --scope takes every scope that has it, and silently removing three
+  # entries when you meant one is the kind of thing you find out much later.
+  local matches
+  matches="$(awk -v n="$name" -v s="$scope" '
+    /^[[:space:]]*(#|$)/ { next }
+    $2==n && (s=="" || $1==s) { print $1"\t"$3 }
+  ' "$target")"
+  if [[ -z "$matches" ]]; then
+    printf '%s%s:%s no entry named: %s%s\n' "$e_err" "$self" "$e_off" "$name" "${scope:+ (scope $scope)}" >&2
+    hint "see what is registered with '$self list'"
+    exit 1
+  fi
+
   # Bare `mktemp` on macOS ignores TMPDIR in favour of the Darwin per-user temp
   # dir, so it fails outright wherever that dir isn't writable (sandboxes, some
   # CI). Give it an explicit template rooted in TMPDIR.
   local tmp; tmp="$(mktemp "${TMPDIR:-/tmp}/sklink-manifest.XXXXXX")" || die "cannot create temp file"
   awk -v n="$name" -v s="$scope" '
     /^[[:space:]]*(#|$)/ { print; next }
-    { if ($2==n && (s=="" || $1==s)) { removed++; next } print }
-    END { if (!removed) exit 3 }
-  ' "$target" > "$tmp" || { rm -f "$tmp"; die "no manifest entry named: $name${scope:+ (scope $scope)}"; }
+    { if ($2==n && (s=="" || $1==s)) { next } print }
+  ' "$target" > "$tmp" || { rm -f "$tmp"; die "cannot rewrite $target"; }
   # Carry the real file's permissions across: mktemp creates 0600 and mv keeps
   # that mode, quietly tightening a manifest that was group- or world-readable.
   # stat is spelled differently on BSD and GNU; a failure here is not fatal.
   local mode; mode="$(stat -f '%Lp' "$target" 2>/dev/null || stat -c '%a' "$target" 2>/dev/null || true)"
   [[ -n "$mode" ]] && chmod "$mode" "$tmp" 2>/dev/null || true
   mv "$tmp" "$target"
-  printf 'removed %s from manifest\n' "$name"
+
+  local s_ src_
+  while IFS=$'\t' read -r s_ src_; do
+    [[ -z "${s_:-}" ]] && continue
+    printf '%sremoved%s  %s  %s%s%s  %s(%s)%s\n' \
+      "$c_yellow" "$c_off" "$name" "$c_dim" "$(show_path "${src_:-}")" "$c_off" "$c_dim" "$s_" "$c_off"
+  done <<< "$matches"
   cmd_sync
 }
 
+# --- doctor -----------------------------------------------------------------
+# Three questions, in the order they break: are the sources real, are the links
+# the manifest asks for actually on disk, and is anything left over from an
+# earlier manifest. Exits non-zero when it found something wrong, so it can gate
+# a hook or a CI step.
 cmd_doctor() {
   require_manifest
   local state="${XDG_STATE_HOME:-$HOME/.local/state}/sklink/managed.tsv"
-  printf '== manifest ==\n  %s\n' "$manifest"
-  printf '\n== detected user roots ==\n'
-  # Ask the reconciler rather than re-deriving the list here — a second copy drifts.
-  bash "$linker" --print-roots | sed 's/^/  /'
-  printf '\n== manifest sources ==\n'
-  grep -vE '^[[:space:]]*(#|$)' "$manifest" | while read -r scope name src _; do
-    src="$(expand_tilde "$src")"
-    if [[ -f "$src/SKILL.md" ]]; then printf '  ok    %-16s %s\n' "$name" "$src"
-    else printf '  BAD   %-16s %s (missing SKILL.md)\n' "$name" "$src"; fi
+  local src_bad=0 link_bad=0 problems=0 unchecked=0 count roots
+
+  count="$(manifest_count)"
+  printf '%-9s %s  %s(%s skill%s)%s\n' "manifest" "$(show_path "$manifest")" "$c_dim" "$count" "$(plural "$count")" "$c_off"
+
+  roots="$(bash "$linker" --print-roots 2>/dev/null || true)"
+  if [[ -z "$roots" ]]; then
+    printf '%-9s %snone detected — no agent home directory found%s\n' "roots" "$c_yellow" "$c_off"
+  else
+    local first=1 r
+    while read -r r; do
+      [[ -z "${r:-}" ]] && continue
+      if [[ "$first" == 1 ]]; then printf '%-9s %s\n' "roots" "$(show_path "$r")"; first=0
+      else printf '%-9s %s\n' "" "$(show_path "$r")"; fi
+    done <<< "$roots"
+  fi
+
+  # --- sources ---
+  printf '\n%ssources%s\n' "$c_bold" "$c_off"
+  if [[ "$count" == 0 ]]; then
+    printf '  %s(none registered — %s add <skill-dir>)%s\n' "$c_dim" "$self" "$c_off"
+  fi
+  local scope name src rest ex declared note colour word w=8
+  while read -r scope name src rest || [[ -n "${scope:-}" ]]; do
+    [[ -z "${scope:-}" ]] && continue
+    case "$scope" in \#*) continue;; esac
+    if [[ -n "${name:-}" && ${#name} -gt $w ]]; then w=${#name}; fi
+  done < "$manifest"
+  if [[ $w -gt 28 ]]; then w=28; fi
+
+  while read -r scope name src rest || [[ -n "${scope:-}" ]]; do
+    [[ -z "${scope:-}" ]] && continue
+    case "$scope" in \#*) continue;; esac
+    if [[ -z "${name:-}" || -z "${src:-}" ]]; then
+      printf '  %s%-8s%s %s\n' "$c_red" "BAD" "$c_off" "malformed line: $scope ${name:-}"
+      src_bad=$((src_bad + 1)); continue
+    fi
+    ex="$(expand_tilde "$src")"; note=""; word="ok"; colour="$c_green"
+    if [[ ! -d "$ex" ]]; then
+      word="MISSING"; colour="$c_red"; note="no such directory"
+    elif [[ ! -f "$ex/SKILL.md" ]]; then
+      word="BAD"; colour="$c_red"; note="no SKILL.md"
+    else
+      declared="$(skill_name_for "$ex")"
+      if [[ "$declared" != "$name" ]]; then
+        word="NAME"; colour="$c_yellow"; note="its SKILL.md says \"$declared\""
+      fi
+    fi
+    case "$scope" in
+      project:*)
+        if [[ ! -d "$(expand_tilde "${scope#project:}")" ]]; then
+          word="BAD"; colour="$c_red"; note="repo not found: $(show_path "${scope#project:}")"
+        fi;;
+      user) ;;
+      *) word="BAD"; colour="$c_red"; note="unknown scope: $scope";;
+    esac
+    [[ "$word" == "ok" ]] || src_bad=$((src_bad + 1))
+    printf '  %s%-8s%s %-*s %s%s%s%s\n' "$colour" "$word" "$c_off" "$w" "$name" \
+      "$c_dim" "$(show_path "$src")" "$c_off" "${note:+  $c_red$note$c_off}"
+  done < "$manifest"
+
+  # --- links ---
+  # The plan comes from the reconciler, so this checks the links sync would
+  # really make rather than a second implementation of the same rules.
+  local plan; plan="$(SKLINK_MANIFEST="$manifest" bash "$linker" --print-plan 2>/dev/null || true)"
+  local paths=() sources=() lp ls i
+  while IFS=$'\t' read -r lp ls; do
+    [[ -z "${lp:-}" ]] && continue
+    paths+=("$lp"); sources+=("${ls:-}")
+  done <<< "$plan"
+
+  printf '\n%slinks%s\n' "$c_bold" "$c_off"
+  local nplan=${#paths[@]}
+  if [[ "$nplan" == 0 ]]; then
+    printf '  %s(nothing to link)%s\n' "$c_dim" "$c_off"
+  fi
+
+  # Group by root: one line per skills directory beats repeating a long root
+  # path on every link. Measure the collapsed form, since that is what prints.
+  local link_roots=() root shown rw=16
+  for ((i = 0; i < nplan; i++)); do
+    root="${paths[$i]%/*}"
+    if ! in_list "$root" ${link_roots[@]+"${link_roots[@]}"}; then
+      link_roots+=("$root")
+      shown="$(show_path "$root")"
+      if [[ ${#shown} -gt $rw ]]; then rw=${#shown}; fi
+    fi
   done
-  printf '\n== managed links ==\n'
+  if [[ $rw -gt 40 ]]; then rw=40; fi
+
+  local nok detail target
+  for root in ${link_roots[@]+"${link_roots[@]}"}; do
+    # A root we can't look inside makes every -L test below read false, which
+    # would report a healthy link as MISSING and invite someone to "fix" it.
+    # Agents run sandboxed and are exactly who runs this, so say so instead.
+    if [[ -d "$root" && ! -r "$root" ]]; then
+      nok=0
+      for ((i = 0; i < nplan; i++)); do
+        [[ "${paths[$i]%/*}" == "$root" ]] && nok=$((nok + 1))
+      done
+      printf '  %-*s  %sUNREADABLE%s %s(%s link%s not checked — permissions or sandbox)%s\n' \
+        "$rw" "$(show_path "$root")" "$c_yellow" "$c_off" "$c_dim" "$nok" "$(plural "$nok")" "$c_off"
+      unchecked=$((unchecked + nok))
+      continue
+    fi
+    nok=0; detail=""
+    for ((i = 0; i < nplan; i++)); do
+      [[ "${paths[$i]%/*}" == "$root" ]] || continue
+      lp="${paths[$i]}"; ls="${sources[$i]}"; name="${lp##*/}"
+      if [[ -L "$lp" ]]; then
+        target="$(readlink "$lp")"
+        if [[ "$target" != "$ls" ]]; then
+          detail+="      ${c_yellow}WRONG   ${c_off} $name ${c_dim}-> $(show_path "$target")${c_off}"$'\n'
+          link_bad=$((link_bad + 1))
+        elif [[ ! -e "$lp" ]]; then
+          detail+="      ${c_red}DANGLING${c_off} $name ${c_dim}-> $(show_path "$target")${c_off}"$'\n'
+          link_bad=$((link_bad + 1))
+        else
+          nok=$((nok + 1))
+        fi
+      elif [[ -e "$lp" ]]; then
+        detail+="      ${c_red}BLOCKED ${c_off} $name ${c_dim}(a real file or directory is in the way)${c_off}"$'\n'
+        link_bad=$((link_bad + 1))
+      else
+        detail+="      ${c_red}MISSING ${c_off} $name"$'\n'
+        link_bad=$((link_bad + 1))
+      fi
+    done
+    if [[ -z "$detail" ]]; then
+      printf '  %-*s  %s%s ok%s\n' "$rw" "$(show_path "$root")" "$c_green" "$nok" "$c_off"
+    else
+      printf '  %-*s  %s%s ok%s\n' "$rw" "$(show_path "$root")" "$c_dim" "$nok" "$c_off"
+      printf '%s' "$detail"
+    fi
+  done
+
+  # --- leftovers ---
+  # Links this tool made for a manifest entry that is gone. `sync` prunes them;
+  # they only show up here when the manifest was edited without a sync.
+  local stale=""
   if [[ -f "$state" ]]; then
-    while IFS=$'\t' read -r root name; do
-      [[ -z "${root:-}" ]] && continue
-      # A root we can't look inside makes every -L test below read false, which
-      # would report a healthy link as MISSING and invite someone to "fix" it.
-      # Agents run sandboxed and are exactly who runs this, so say so instead.
-      if [[ -d "$root" && ! -r "$root" ]]; then printf '  UNREADABLE %s/%s (cannot check — permissions or sandbox)\n' "$root" "$name"
-      elif [[ -L "$root/$name" && -e "$root/$name" ]]; then printf '  ok    %s/%s\n' "$root" "$name"
-      elif [[ -L "$root/$name" ]]; then printf '  DANGLING %s/%s\n' "$root" "$name"
-      else printf '  MISSING  %s/%s\n' "$root" "$name"; fi
+    local sr sn
+    while IFS=$'\t' read -r sr sn; do
+      [[ -z "${sr:-}" || -z "${sn:-}" ]] && continue
+      if ! in_list "$sr/$sn" ${paths[@]+"${paths[@]}"}; then
+        [[ -L "$sr/$sn" ]] && stale+="  $(show_path "$sr/$sn")"$'\n'
+      fi
     done < "$state"
-  else printf '  (no state yet — run: %s sync)\n' "$self"; fi
+  elif [[ "$nplan" -gt 0 ]]; then
+    printf '  %s(no links recorded yet — run: %s sync)%s\n' "$c_dim" "$self" "$c_off"
+  fi
+  if [[ -n "$stale" ]]; then
+    printf '\n%sno longer in the manifest%s %s(%s sync removes these)%s\n' "$c_bold" "$c_off" "$c_dim" "$self" "$c_off"
+    printf '%s' "$stale"
+  fi
+
+  problems=$((src_bad + link_bad))
+  printf '\n'
+  if [[ "$problems" == 0 ]]; then
+    printf '%sall good%s  %s%s source%s, %s link%s' "$c_green" "$c_off" "$c_dim" \
+      "$count" "$(plural "$count")" "$nplan" "$(plural "$nplan")"
+    [[ "$unchecked" -gt 0 ]] && printf ' (%s unchecked)' "$unchecked"
+    printf '%s\n' "$c_off"
+    return 0
+  fi
+
+  # Point at the one thing that actually fixes what was found: a broken link is
+  # a job for sync, a broken source is a job for you.
+  local advice
+  if [[ "$src_bad" -gt 0 ]]; then
+    advice="fix the sources above — '$self edit' to change the manifest"
+    [[ "$link_bad" -gt 0 ]] && advice="$advice, then '$self sync'"
+  else
+    advice="run '$self sync'"
+  fi
+  printf '%s%s problem%s%s  %s%s%s\n' \
+    "$c_red" "$problems" "$(plural "$problems")" "$c_off" "$c_dim" "$advice" "$c_off"
+  return 1
 }
 
 sub="${1:-}"; [[ $# -gt 0 ]] && shift || true
 case "$sub" in
-  list)   cmd_list "$@";;
-  sync)   cmd_sync "$@";;
-  add)    cmd_add "$@";;
-  rm)     cmd_rm "$@";;
-  doctor) cmd_doctor "$@";;
-  ""|-h|--help|help) usage;;
-  *) die "unknown command: $sub (try: $self --help)";;
+  list|ls)          cmd_list "$@";;
+  sync)             cmd_sync "$@";;
+  add)              cmd_add "$@";;
+  rm|remove)        cmd_rm "$@";;
+  doctor|check)     cmd_doctor "$@";;
+  edit)             cmd_edit "$@";;
+  init)             cmd_init "$@";;
+  -V|--version|version) printf '%s %s\n' "$self" "$version";;
+  ""|-h|--help|help)    usage;;
+  *)
+    printf '%s%s:%s unknown command: %s\n' "$e_err" "$self" "$e_off" "$sub" >&2
+    hint "try '$self --help'"
+    exit 1;;
 esac

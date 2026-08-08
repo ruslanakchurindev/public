@@ -1,0 +1,27 @@
+# @CMD@ manifest — the single source of truth for where each skill is linked.
+#
+# One skill per line, whitespace-separated:
+#
+#   <scope>              <name>          <source-dir>
+#
+# For example (uncomment to try, or run `@CMD@ add <dir>` and let the CLI write it):
+#
+#   user                 code-review     ~/skills/code-review
+#   project:~/Code/api   deploy          ~/skills/deploy
+#
+# scope
+#   user                 link into every agent on this machine: ~/.claude/skills,
+#                        ~/.codex/skills, ~/.agents/skills — whichever exist
+#   project:<repo>       link into <repo>/.claude/skills and <repo>/.codex/skills
+#
+# name                   what the agent sees. Keep it equal to the `name:` in the
+#                        source SKILL.md frontmatter — `@CMD@ doctor` checks that.
+#
+# source-dir             the one real copy of the skill; must contain SKILL.md.
+#                        `~` expands to your home directory. No spaces in the path.
+#
+# Blank lines and lines starting with # are ignored, and a # comment may also
+# follow an entry.
+#
+# After editing this file by hand, reconcile the links:  @CMD@ sync
+# Or let the CLI do both at once:                        @CMD@ edit

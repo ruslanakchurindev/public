@@ -9,9 +9,11 @@ Conventions for working in this repo.
 - `SKILL.md` follows the write-a-skill convention: `name` / `description` / `license`
   frontmatter, under 100 lines, with detail pushed to the skill's `README.md` or `references/`.
 - Standalone command-line tools live in their own top-level directory (e.g. `sklink/`):
-  executables at the directory root, tests under `<tool>/scripts/`, docs in `<tool>/README.md`.
+  executables at the directory root, tests under `<tool>/scripts/`, docs in `<tool>/README.md`,
+  and any file the tool writes into a user's config seeded from `<tool>/templates/`.
   A tool must write nothing inside this checkout at runtime — user data belongs in
   `$XDG_CONFIG_HOME` / `$XDG_STATE_HOME`, so pulling an update never conflicts with it.
+  Never overwrite a user's existing config; create it only when it is absent.
 - Shell scripts must stay portable across macOS `bash` 3.2 and Linux (GNU). Run a skill's or
   tool's tests before publishing, e.g. `GIT_CONFIG_GLOBAL=/dev/null skills/handover/scripts/test-handover.sh`
   or `bash sklink/scripts/test-sklink.sh`.
