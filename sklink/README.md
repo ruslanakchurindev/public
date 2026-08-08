@@ -213,7 +213,7 @@ removes the symlink only if it still points at this checkout.
 bash sklink/scripts/test-sklink.sh
 ```
 
-106 hermetic checks covering fan-out, pruning, idempotence, the non-symlink
+110 hermetic checks covering fan-out, pruning, idempotence, the non-symlink
 guard, missing sources and missing project repos, orphan-free state, the CLI
 (`add`/`rm`/dedup/unterminated manifest/self-naming/reconciler resolution
 through a PATH symlink), writing through a symlinked manifest without replacing

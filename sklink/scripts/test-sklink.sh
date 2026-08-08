@@ -20,6 +20,12 @@ CLI="$tool_dir/sklink"
 # (/src, /rootA, /log) — so honour TMPDIR and refuse to run without a workspace.
 WS="$(mktemp -d "${TMPDIR:-/tmp}/sklink-test.XXXXXX")" || exit 1
 [ -n "$WS" ] && [ -d "$WS" ] || { echo "cannot create temp workspace" >&2; exit 1; }
+# Normalise the workspace path. macOS sets TMPDIR with a trailing slash, so WS
+# arrives containing '//'. The CLI derives paths with `cd && pwd`, which collapses
+# that, and a $HOME-under-WS test then compares a normalised path against a
+# non-normalised $HOME and sees no match — failing on stock macOS but not where
+# TMPDIR has no trailing slash.
+WS="$(cd "$WS" && pwd)"
 trap 'rm -rf "$WS"' EXIT
 
 SRC="$WS/src"; ROOTA="$WS/rootA"; ROOTB="$WS/rootB"; PROJ="$WS/proj"
@@ -160,6 +166,21 @@ check "[ $? -eq 0 ]" "add under \$HOME exits 0"
 check "grep -q '~/proj/myskill' '$MAN'" "source collapsed to ~/proj/myskill"
 check "! grep -qF '\~' '$MAN'" "manifest has no literal backslash-tilde"
 check "islink '$ROOTA/myskill'" "reconciler resolved the ~ source and linked it"
+
+echo "# 13b. a \$HOME containing glob characters collapses literally, or not at all"
+# Regression: collapse_home used ${p/#$HOME/~}, which expands $HOME as a pattern.
+# With HOME=.../ho?me, the unrelated path .../hoXme/proj/myskill matched and was
+# stored as ~/proj/myskill — a path that expands back to a directory that does
+# not exist. Storing it uncollapsed is correct; storing a wrong ~ is not.
+GLOBHOME="$WS/ho?me"; OTHER="$WS/hoXme"
+mkdir -p "$GLOBHOME"; mkskill "$OTHER/proj/myskill"
+writeman
+HOME="$GLOBHOME" SKLINK_MANIFEST="$MAN" XDG_STATE_HOME="$STATE" SKLINK_ROOTS="$ROOTS" \
+  bash "$CLI" add "$OTHER/proj/myskill" --user >"$LOG" 2>&1
+check "[ $? -eq 0 ]" "add with a glob-ish \$HOME exits 0"
+check "! grep -q '~/proj/myskill' '$MAN'" "look-alike path not collapsed to ~"
+check "grep -qF '$OTHER/proj/myskill' '$MAN'" "stored as the real absolute path"
+check "islink '$ROOTA/myskill'" "and it links to the directory that exists"
 
 echo "# 14. project scope refuses a repo that isn't there"
 # Regression: mkdir -p in link_one would conjure a whole phantom repo out of a

@@ -54,7 +54,18 @@ EOF
 }
 
 expand_tilde() { printf '%s' "${1/#\~/$HOME}"; }
-collapse_home() { printf '%s' "${1/#$HOME/~}"; }
+
+# Literal prefix comparison, not pattern substitution. ${p/#$HOME/~} expands
+# $HOME as a glob, so a home directory containing ? or [ ] matches paths that
+# merely resemble it: /home/a?c would collapse /home/abc/skills to ~/skills,
+# which expands back to a directory that isn't there.
+collapse_home() {
+  local p="$1"
+  if [[ "$p" == "$HOME" ]]; then printf '~'
+  elif [[ "$p" == "$HOME"/* ]]; then printf '~%s' "${p#"$HOME"}"
+  else printf '%s' "$p"
+  fi
+}
 
 # Follow a symlink chain to the real file. Rewriting the manifest with
 # `mv tmp $manifest` would otherwise replace the symlink itself with a regular
