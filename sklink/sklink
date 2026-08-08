@@ -203,7 +203,11 @@ cmd_doctor() {
   if [[ -f "$state" ]]; then
     while IFS=$'\t' read -r root name; do
       [[ -z "${root:-}" ]] && continue
-      if [[ -L "$root/$name" && -e "$root/$name" ]]; then printf '  ok    %s/%s\n' "$root" "$name"
+      # A root we can't look inside makes every -L test below read false, which
+      # would report a healthy link as MISSING and invite someone to "fix" it.
+      # Agents run sandboxed and are exactly who runs this, so say so instead.
+      if [[ -d "$root" && ! -r "$root" ]]; then printf '  UNREADABLE %s/%s (cannot check — permissions or sandbox)\n' "$root" "$name"
+      elif [[ -L "$root/$name" && -e "$root/$name" ]]; then printf '  ok    %s/%s\n' "$root" "$name"
       elif [[ -L "$root/$name" ]]; then printf '  DANGLING %s/%s\n' "$root" "$name"
       else printf '  MISSING  %s/%s\n' "$root" "$name"; fi
     done < "$state"

@@ -163,6 +163,11 @@ Agent roots are **auto-detected**: a root is used only if that agent's home
 directory exists, so installing or removing an agent just works. See what was
 detected with `sklink doctor`, or override the set entirely with `SKLINK_ROOTS`.
 
+`doctor` distinguishes a link that is gone (`MISSING`) from a root it isn't
+allowed to look inside (`UNREADABLE`) — a sandboxed agent is often denied a stat
+in another agent's home, and reporting those links as missing would invite a
+destructive "fix".
+
 `sklink-sync` is safe to run directly — from a shell hook, a login script, or
 cron — without going through the CLI.
 
@@ -208,11 +213,11 @@ removes the symlink only if it still points at this checkout.
 bash sklink/scripts/test-sklink.sh
 ```
 
-103 hermetic checks covering fan-out, pruning, idempotence, the non-symlink
+106 hermetic checks covering fan-out, pruning, idempotence, the non-symlink
 guard, missing sources and missing project repos, orphan-free state, the CLI
 (`add`/`rm`/dedup/unterminated manifest/self-naming/reconciler resolution
 through a PATH symlink), writing through a symlinked manifest without replacing
-it, manifest defaulting and creation, `doctor`, and the
+it, manifest defaulting and creation, `doctor` (including an unreadable root), and the
 installer (idempotence, `--name`, the clobber guard, `--uninstall` refusing a
 link it didn't make, and a half-copied checkout). The suite runs entirely inside
 a temp workspace via `SKLINK_MANIFEST` / `SKLINK_ROOTS` / `XDG_CONFIG_HOME` /

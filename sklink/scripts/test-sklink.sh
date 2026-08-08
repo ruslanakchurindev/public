@@ -229,6 +229,28 @@ XDG_CONFIG_HOME="$EMPTY" XDG_STATE_HOME="$STATE" SKLINK_ROOTS="$ROOTS" \
 check "[ $? -ne 0 ]" "reconciler alone exits non-zero without a manifest"
 check "grep -q 'manifest not found' '$LOG'" "reconciler says which path it tried"
 
+echo "# 18b. doctor tells an unreadable root apart from a missing link"
+# A sandboxed agent may be denied even a stat inside an agent's home. Every -L
+# test then reads false, and reporting a healthy link as MISSING invites a
+# destructive "fix". Root can read anything, so there is nothing to prove there.
+if [ "$(id -u)" = 0 ]; then
+  ok "skipped as root - unreadable dirs are readable to root"
+else
+  SEALED="$WS/sealed"; mkdir -p "$SEALED"
+  writeman "user alpha $SRC/alpha"
+  SKLINK_MANIFEST="$MAN" XDG_STATE_HOME="$STATE" SKLINK_ROOTS="$SEALED" bash "$LINKER" >"$LOG" 2>&1
+  chmod 000 "$SEALED"
+  SKLINK_MANIFEST="$MAN" XDG_STATE_HOME="$STATE" SKLINK_ROOTS="$SEALED" bash "$CLI" doctor >"$LOG" 2>&1
+  check "grep -q UNREADABLE '$LOG'" "unreadable root reported as UNREADABLE"
+  check "! grep -q MISSING '$LOG'" "not reported as MISSING"
+  chmod 755 "$SEALED"
+  SKLINK_MANIFEST="$MAN" XDG_STATE_HOME="$STATE" SKLINK_ROOTS="$SEALED" bash "$CLI" doctor >"$LOG" 2>&1
+  check "grep -q 'ok    $SEALED/alpha' '$LOG'" "readable again: back to ok"
+fi
+# restore the roots the later tests expect
+writeman "user alpha $SRC/alpha"
+sync
+
 echo "# 19b. a symlinked manifest is written through, not replaced"
 # Regression: `sklink rm` rewrote the manifest with `mv tmp $manifest`, which
 # replaces a symlink with a regular file. A manifest kept in a repo and linked
