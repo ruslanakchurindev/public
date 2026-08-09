@@ -6,6 +6,13 @@ set -euo pipefail
 # with latest symlinks per repo. Named handovers use <name>-<utc>.md and
 # latest-<name>.md.
 #
+# `latest` and `list` derive their answer by scanning the store, never by
+# following the latest symlinks: those track one save track each, so a named
+# save left the unnamed pointer stale and `latest` disagreed with `list`. The
+# symlinks are still written, purely as a convenience for humans browsing the
+# store. Ordering comes from the UTC stamp in the filename, not mtime, which a
+# copy or restore rewrites.
+#
 # Optional metadata overrides written into each artifact:
 #   HANDOVER_REPO_NAME / HANDOVER_WORKSPACE_NAME / HANDOVER_MODEL_NAME
 
@@ -107,6 +114,20 @@ model_name="${HANDOVER_MODEL_NAME:-unknown}"
 hash="$(printf '%s' "$base" | { shasum 2>/dev/null || sha1sum; } | cut -c1-8)"
 dir="$store_root/$(basename "$base")-$hash"
 
+# Which worktree this invocation is in. All worktrees of a repo share one store
+# (see the base resolution above), so this is what tells artifacts apart inside
+# it. Recorded on save and matched on `latest`. `workspace-path` can't serve:
+# it is the save's working directory, which may be a subdir of the worktree, and
+# it is not symlink-resolved. Empty for a bare repo or a non-repo directory.
+worktree_root="$(git -C "$abs" rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -n "$worktree_root" && -d "$worktree_root" ]]; then
+  worktree_root="$(cd "$worktree_root" && pwd -P)"
+fi
+
+# Artifact filenames are <utc>.md or <name>-<utc>.md, optionally -<n> on collision.
+ts_re='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{6}Z(-[0-9]+)?\.md$'
+stem_re='^(.+-)?([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{6}Z)(-([0-9]+))?$'
+
 ensure_store_dir() {
   mkdir -p "$store_root" "$dir"
   chmod 700 "$store_root" "$dir" 2>/dev/null || true
@@ -137,9 +158,148 @@ write_metadata_header() {
   printf 'repo: %s\n' "$(metadata_value "$repo_name")"
   printf 'workspace: %s\n' "$(metadata_value "$workspace_name")"
   printf 'workspace-path: %s\n' "$(metadata_value "$abs")"
+  printf 'worktree: %s\n' "$(metadata_value "$worktree_root")"
   printf 'model: %s\n' "$(metadata_value "$model_name")"
   printf 'name: %s\n' "$(metadata_value "${name:-default}")"
   printf -- '-->\n\n'
+}
+
+# Sub-second mtime, or 0 where the platform won't give one. Used only to break
+# ties, so a copy that rewrites mtimes cannot reorder distinct seconds.
+mtime_key() {
+  local value
+  value="$(stat -f '%Fm' "$1" 2>/dev/null || true)"
+  [[ "$value" =~ ^[0-9]+(\.[0-9]+)?$ ]] || value="$(stat -c '%.9Y' "$1" 2>/dev/null || true)"
+  [[ "$value" =~ ^[0-9]+(\.[0-9]+)?$ ]] || value=0
+  printf '%s' "$value"
+}
+
+# Sort key for one artifact: "<stamp>\t<mtime>\t<collision-n>\t<path>".
+# The stamp comes from the filename and is the durable part. Two saves in the
+# same second need the tiebreaks: the -<n> counter is claimed per filename, so
+# it cannot order an unnamed save against a named one -- sub-second mtime can.
+# A file with no stamp was dropped in by hand; order it by mtime rather than
+# hide it.
+artifact_key() {
+  local file="$1" stem ts n
+  stem="$(basename "$file")"
+  stem="${stem%.md}"
+  if [[ "$stem" =~ $stem_re ]]; then
+    ts="${BASH_REMATCH[2]}"
+    n="${BASH_REMATCH[4]:-0}"
+  else
+    ts="$(date -u -r "$file" +%Y-%m-%dT%H%M%SZ 2>/dev/null || printf '0000-00-00T000000Z')"
+    n=0
+  fi
+  printf '%s\t%s\t%s\t%s\n' "$ts" "$(mtime_key "$file")" "$n" "$file"
+}
+
+# Every artifact in the store, newest first. Unnamed invocations pool named and
+# unnamed artifacts together so "the latest handover" has one answer; --name
+# narrows to that track. Returns 1 when the store holds nothing.
+collect_artifacts() {
+  shopt -s nullglob
+  local files=() out=() file base_file
+  if [[ -n "$name" ]]; then
+    files=( "$dir/$name-"*.md )
+  else
+    files=( "$dir"/*.md )
+  fi
+  # bash 3.2 treats "${files[@]}" on an empty array as an unbound variable.
+  [[ ${#files[@]} -gt 0 ]] || return 1
+  for file in "${files[@]}"; do
+    base_file="$(basename "$file")"
+    [[ "$base_file" == latest*.md ]] && continue
+    # For a named list the remainder after "<name>-" must be exactly a
+    # timestamp, else name "sprint" would also match "sprint-2026"'s files.
+    if [[ -n "$name" ]]; then
+      [[ "${base_file#"$name"-}" =~ $ts_re ]] || continue
+    fi
+    [[ -f "$file" && ! -L "$file" ]] || continue
+    out+=( "$(artifact_key "$file")" )
+  done
+  [[ ${#out[@]} -gt 0 ]] || return 1
+  printf '%s\n' "${out[@]}" | LC_ALL=C sort -t"$(printf '\t')" -k1,1r -k2,2nr -k3,3nr
+}
+
+no_artifacts_error() {
+  if [[ -n "$name" ]]; then
+    printf 'error: no handover artifacts named %s for %s\n' "$name" "$base" >&2
+  else
+    printf 'error: no handover artifacts for %s\n' "$base" >&2
+  fi
+  exit 1
+}
+
+# One metadata field from an artifact's header, if it has one.
+artifact_field() {
+  local file="$1" key="$2" line count=0
+  while IFS= read -r line; do
+    count=$((count + 1))
+    [[ $count -gt 20 ]] && break
+    case "$line" in
+      '-->'*) break ;;
+      "$key: "*)
+        printf '%s' "${line#"$key": }"
+        return 0
+        ;;
+    esac
+  done < "$file"
+  return 1
+}
+
+# The worktree an artifact was produced in. Falls back to workspace-path for
+# artifacts written before the worktree field existed.
+artifact_worktree() {
+  local file="$1" value
+  value="$(artifact_field "$file" worktree || true)"
+  if [[ -z "$value" || "$value" == unknown ]]; then
+    value="$(artifact_field "$file" workspace-path || true)"
+  fi
+  [[ -n "$value" && "$value" != unknown ]] || return 1
+  printf '%s' "$value"
+}
+
+from_this_worktree() {
+  local file="$1" value resolved
+  [[ -n "$worktree_root" ]] || return 1
+  value="$(artifact_field "$file" worktree || true)"
+  if [[ -n "$value" && "$value" != unknown ]]; then
+    # Already a resolved worktree root: exact match, nothing to infer.
+    [[ "$value" == "$worktree_root" ]]
+    return
+  fi
+  # Written before the worktree field existed. workspace-path is the save's
+  # working directory, possibly a subdir and not symlink-resolved, so ask git
+  # which worktree owns it. A prefix test would not do: worktrees are routinely
+  # nested inside the main checkout (.worktrees/*), and the parent would then
+  # claim its children's handovers as its own. If the directory is gone there is
+  # nothing left to resolve, so leave it to the repo-wide fallback.
+  value="$(artifact_field "$file" workspace-path || true)"
+  [[ -n "$value" && "$value" != unknown && -d "$value" ]] || return 1
+  resolved="$(git -C "$value" rev-parse --show-toplevel 2>/dev/null || true)"
+  [[ -n "$resolved" ]] || return 1
+  resolved="$(cd "$resolved" && pwd -P)"
+  [[ "$resolved" == "$worktree_root" ]]
+}
+
+# Falling back to another worktree's handover is a correct answer but not an
+# obvious one -- branch, HEAD, and uncommitted work are per-worktree. Say so on
+# stderr so stdout stays a bare path.
+report_fallback() {
+  local file="$1" value presence
+  [[ -n "$worktree_root" ]] || return 0
+  if ! value="$(artifact_worktree "$file")"; then
+    printf 'note: newest handover for this repo records no originating worktree\n' >&2
+    return 0
+  fi
+  if [[ -d "$value" ]]; then
+    presence="still present"
+  else
+    presence="no longer present"
+  fi
+  printf 'note: no handover from this worktree (%s); using the newest for this repo, produced in %s (%s)\n' \
+    "$worktree_root" "$value" "$presence" >&2
 }
 
 case "$cmd" in
@@ -180,64 +340,35 @@ case "$cmd" in
       fi
     done
     rm -f "$input" "$output"
+    # Informational only -- resolution scans the store rather than reading these.
     ln -sfn "$(basename "$file")" "$(latest_link)"
     printf '%s\n' "$file"
     ;;
   latest)
     harden_existing_dir
-    link="$(latest_link)"
-    if [[ -e "$link" ]]; then
-      target_path="$(readlink "$link" 2>/dev/null || printf '%s' "$link")"
-      if [[ "$target_path" = /* ]]; then
-        printf '%s\n' "$target_path"
-      else
-        printf '%s/%s\n' "$dir" "$target_path"
+    sorted="$(collect_artifacts)" || no_artifacts_error
+    newest=""
+    chosen=""
+    while IFS="$(printf '\t')" read -r _ts _mtime _n file; do
+      [[ -n "$newest" ]] || newest="$file"
+      # --name is already an explicit thread selector; don't second-guess it
+      # with a worktree preference.
+      [[ -n "$name" ]] && break
+      if from_this_worktree "$file"; then
+        chosen="$file"
+        break
       fi
-    else
-      if [[ -n "$name" ]]; then
-        printf 'error: no handover artifacts named %s for %s\n' "$name" "$base" >&2
-      else
-        printf 'error: no handover artifacts for %s\n' "$base" >&2
-      fi
-      exit 1
+    done < <(printf '%s\n' "$sorted")
+    if [[ -z "$chosen" ]]; then
+      chosen="$newest"
+      [[ -n "$name" ]] || report_fallback "$chosen"
     fi
+    printf '%s\n' "$chosen"
     ;;
   list)
     harden_existing_dir
-    if [[ ! -d "$dir" ]]; then
-      printf 'error: no handover artifacts for %s\n' "$base" >&2
-      exit 1
-    fi
-    shopt -s nullglob
-    # Artifact timestamps are <YYYY>-<MM>-<DD>T<HHMMSS>Z, optionally -<n> on collision.
-    ts_re='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{6}Z(-[0-9]+)?\.md$'
-    if [[ -n "$name" ]]; then
-      files=( "$dir/$name-"*.md )
-    else
-      files=( "$dir"/*.md )
-    fi
-    artifacts=()
-    if [[ ${#files[@]} -gt 0 ]]; then
-      for file in "${files[@]}"; do
-        base_file="$(basename "$file")"
-        [[ "$base_file" == latest*.md ]] && continue
-        # For a named list the remainder after "<name>-" must be exactly a
-        # timestamp, else name "sprint" would also match "sprint-2026"'s files.
-        if [[ -n "$name" ]]; then
-          [[ "${base_file#"$name"-}" =~ $ts_re ]] || continue
-        fi
-        [[ -f "$file" && ! -L "$file" ]] && artifacts+=( "$file" )
-      done
-    fi
-    if [[ ${#artifacts[@]} -eq 0 ]]; then
-      if [[ -n "$name" ]]; then
-        printf 'error: no handover artifacts named %s for %s\n' "$name" "$base" >&2
-      else
-        printf 'error: no handover artifacts for %s\n' "$base" >&2
-      fi
-      exit 1
-    fi
-    ls -1t "${artifacts[@]}"
+    sorted="$(collect_artifacts)" || no_artifacts_error
+    printf '%s\n' "$sorted" | cut -f4-
     ;;
   *)
     usage

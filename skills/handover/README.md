@@ -27,11 +27,22 @@ scripts/handover.sh list .                  # list artifact paths, newest first
 scripts/handover.sh state . [since-ref]     # print workspace snapshot
 ```
 
+`latest` and `list` derive their answer by scanning the store: every artifact is
+considered, named or not, ordered by the UTC stamp in its filename rather than by
+mtime or by the `latest*.md` symlinks. Those symlinks are still written but are
+informational — each tracks only its own save track, so following one would return
+a stale answer as soon as the next save used a different name.
+
+`latest` prefers the newest artifact produced in the **current worktree**. When that
+worktree has none, it falls back to the repo's newest and prints a note on stderr
+naming the originating worktree and whether that directory still exists; stdout stays
+a bare path.
+
 Use `--name NAME` with `save`, `latest`, or `list` only when several workstreams in
-the same repo need separate `latest` pointers. `NAME` must be 1–64 characters starting
+the same repo need separate threads. `NAME` must be 1–64 characters starting
 with a letter or digit, then letters, digits, dots, underscores, or hyphens; names
-starting with `latest` are reserved. Named saves update only `latest-NAME.md`; unnamed
-saves update only `latest.md`.
+starting with `latest` are reserved. `--name` is an explicit thread selector, so it
+narrows to that thread and skips the worktree preference.
 
 ## Configuration
 
@@ -49,10 +60,12 @@ Keep `HANDOVER_HOME` on a private, non-shared path — the store is not hardened
 a symlinked or world-writable location. The `<path-hash>` is derived from the
 repository's shared git directory, so **all linked worktrees of one repo share a single
 store** — a handover saved in a worktree is found by `latest`/`list` from the main
-checkout or any sibling worktree, and the metadata's `workspace` / `workspace-path`
-record which worktree produced it. Use `--name` when concurrent worktrees need separate
-`latest` pointers. Moving the repo directory starts a fresh store; earlier handovers
-remain under the old path.
+checkout or any sibling worktree, and the metadata's `worktree` field records which
+worktree produced it. Concurrent worktrees need no coordination: each resolves to its
+own newest handover, and a worktree you later delete leaves its handovers findable from
+anywhere else in the repo. Moving the repo directory starts a fresh store; earlier
+handovers remain under the old path and can be recovered by moving that directory to
+the new hash printed by `handover.sh path .`.
 
 ## Privacy
 
