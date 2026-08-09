@@ -17,7 +17,9 @@ mode_of() {
   fi
 }
 
-tmp="$(mktemp -d)"
+# Explicit template: BSD mktemp ignores $TMPDIR for the bare `mktemp -d` form,
+# which strands the suite in sandboxes that only allow a specific temp root.
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/handover-test.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 
 repo="$tmp/repo"
@@ -66,7 +68,12 @@ grep -q '^name: default$' "$artifact" || fail "artifact metadata missing default
 
 named_artifact="$(printf '# Named Handover\n' | HANDOVER_HOME="$home" "$handover" save "$repo" --name sprint-1)"
 [[ -f "$named_artifact" ]] || fail "named artifact was not written"
-[[ "$(HANDOVER_HOME="$home" "$handover" latest "$repo")" == "$artifact" ]] || fail "named save should not update default latest"
+# Bare latest means "the newest handover for this worktree", named or not: a
+# resuming session does not know which name a past session happened to use, and
+# a stale unnamed pointer is the whole bug this contract closes.
+[[ "$(HANDOVER_HOME="$home" "$handover" latest "$repo")" == "$named_artifact" ]] || fail "bare latest must return the newest artifact, including named ones"
+[[ "$(HANDOVER_HOME="$home" "$handover" latest "$repo" | head -1)" == "$(HANDOVER_HOME="$home" "$handover" list "$repo" | head -1)" ]] || fail "latest and list disagree about the newest artifact"
+[[ "$(readlink "$store_dir/latest.md")" == "$(basename "$artifact")" ]] || fail "unnamed latest symlink should still track unnamed saves"
 [[ "$(HANDOVER_HOME="$home" "$handover" latest "$repo" --name sprint-1)" == "$named_artifact" ]] || fail "named latest did not point at named artifact"
 [[ "$(HANDOVER_HOME="$home" "$handover" list "$repo" --name sprint-1)" == "$named_artifact" ]] || fail "named list did not return named artifact"
 grep -q '^name: sprint-1$' "$named_artifact" || fail "named artifact metadata missing name"
@@ -74,7 +81,7 @@ grep -q '^name: sprint-1$' "$named_artifact" || fail "named artifact metadata mi
 second_named_artifact="$(printf '# Named Handover 2\n' | HANDOVER_HOME="$home" "$handover" save "$repo" --name sprint-1)"
 [[ -f "$second_named_artifact" ]] || fail "second named artifact was not written"
 [[ "$second_named_artifact" != "$named_artifact" ]] || fail "second named artifact overwrote first named artifact"
-[[ "$(HANDOVER_HOME="$home" "$handover" latest "$repo")" == "$artifact" ]] || fail "second named save should not update default latest"
+[[ "$(HANDOVER_HOME="$home" "$handover" latest "$repo")" == "$second_named_artifact" ]] || fail "bare latest did not follow the newest named save"
 [[ "$(HANDOVER_HOME="$home" "$handover" latest "$repo" --name sprint-1)" == "$second_named_artifact" ]] || fail "named latest did not update"
 named_count="$(HANDOVER_HOME="$home" "$handover" list "$repo" --name sprint-1 | wc -l | tr -d ' ')"
 [[ "$named_count" == "2" ]] || fail "named list did not include both named artifacts"
@@ -154,13 +161,100 @@ linked_store="$(HANDOVER_HOME="$wt_home" "$handover" path "$wt_linked")"
 [[ "$main_store" == "$linked_store" ]] || fail "worktree and main checkout resolved to different stores: $main_store vs $linked_store"
 
 wt_artifact="$(printf '# From worktree\n' | HANDOVER_HOME="$wt_home" "$handover" save "$wt_linked")"
-[[ "$(HANDOVER_HOME="$wt_home" "$handover" latest "$wt_main")" == "$wt_artifact" ]] || fail "handover saved in linked worktree not found from main checkout"
+[[ "$(HANDOVER_HOME="$wt_home" "$handover" latest "$wt_main" 2>/dev/null)" == "$wt_artifact" ]] || fail "handover saved in linked worktree not found from main checkout"
 grep -q "^workspace-path: $wt_linked$" "$wt_artifact" || fail "artifact metadata missing originating worktree path"
+grep -q "^worktree: $wt_linked$" "$wt_artifact" || fail "artifact metadata missing worktree field"
 
+# A worktree with no handover of its own falls back to the repo's newest, but
+# says so: branch, HEAD, and uncommitted work are per-worktree, so the next
+# agent must know the artifact came from somewhere else.
+fallback_note="$(HANDOVER_HOME="$wt_home" "$handover" latest "$wt_main" 2>&1 >/dev/null)"
+[[ "$fallback_note" == *"no handover from this worktree"* ]] || fail "cross-worktree fallback did not warn: $fallback_note"
+[[ "$fallback_note" == *"$wt_linked"* ]] || fail "fallback note did not name the originating worktree: $fallback_note"
+[[ "$fallback_note" == *"still present"* ]] || fail "fallback note did not report the worktree as present: $fallback_note"
+
+# Each worktree now resolves to its own newest, and the preference beats
+# recency: main's artifact is older than the one saved in the linked worktree
+# below, yet each side keeps its own.
 main_artifact="$(printf '# From main\n' | HANDOVER_HOME="$wt_home" "$handover" save "$wt_main")"
-[[ "$(HANDOVER_HOME="$wt_home" "$handover" latest "$wt_linked")" == "$main_artifact" ]] || fail "handover saved in main checkout not found from linked worktree"
+[[ "$(HANDOVER_HOME="$wt_home" "$handover" latest "$wt_main")" == "$main_artifact" ]] || fail "main checkout did not resolve to its own handover"
+[[ "$(HANDOVER_HOME="$wt_home" "$handover" latest "$wt_linked")" == "$wt_artifact" ]] || fail "linked worktree did not resolve to its own handover"
+[[ -z "$(HANDOVER_HOME="$wt_home" "$handover" latest "$wt_main" 2>&1 >/dev/null)" ]] || fail "resolving to this worktree's own handover must not warn"
+
+newer_wt_artifact="$(printf '# Newer from worktree\n' | HANDOVER_HOME="$wt_home" "$handover" save "$wt_linked")"
+[[ "$(HANDOVER_HOME="$wt_home" "$handover" latest "$wt_main")" == "$main_artifact" ]] || fail "a newer handover from another worktree must not win over this worktree's own"
+[[ "$(HANDOVER_HOME="$wt_home" "$handover" latest "$wt_linked")" == "$newer_wt_artifact" ]] || fail "linked worktree did not follow its own newest handover"
+
 wt_all_count="$(HANDOVER_HOME="$wt_home" "$handover" list "$wt_linked" | wc -l | tr -d ' ')"
-[[ "$wt_all_count" == "2" ]] || fail "shared worktree store should list both artifacts, got $wt_all_count"
+[[ "$wt_all_count" == "3" ]] || fail "shared worktree store should list every artifact, got $wt_all_count"
+
+# A save from a subdirectory still belongs to its worktree: workspace-path
+# records the subdir, so matching has to use the worktree field.
+mkdir -p "$wt_linked/nested/deeper"
+sub_artifact="$(printf '# From a subdir\n' | HANDOVER_HOME="$wt_home" "$handover" save "$wt_linked/nested/deeper")"
+grep -q "^worktree: $wt_linked$" "$sub_artifact" || fail "subdir save did not record the worktree root"
+[[ "$(HANDOVER_HOME="$wt_home" "$handover" latest "$wt_linked")" == "$sub_artifact" ]] || fail "subdir save not attributed to its worktree"
+[[ "$(HANDOVER_HOME="$wt_home" "$handover" latest "$wt_main")" == "$main_artifact" ]] || fail "subdir save leaked into a sibling worktree"
+
+# Artifacts written before the worktree field existed must still be attributed,
+# via their workspace-path.
+wt_store="$(HANDOVER_HOME="$wt_home" "$handover" path "$wt_main")"
+legacy_artifact="$wt_store/2020-01-01T000000Z.md"
+cat > "$legacy_artifact" <<EOF
+<!-- handover-metadata
+generated: 2020-01-01T00:00:00Z
+repo: wt-main
+workspace: wt-main
+workspace-path: $wt_main
+model: legacy
+name: default
+-->
+
+# Legacy
+EOF
+legacy_only="$tmp/legacy-only"
+git -C "$wt_main" worktree add -q "$legacy_only" -b legacy-only
+[[ "$(HANDOVER_HOME="$wt_home" "$handover" latest "$wt_main")" == "$main_artifact" ]] || fail "legacy artifact should not outrank a newer one from the same worktree"
+git -C "$wt_main" worktree remove --force "$legacy_only"
+
+# A worktree nested inside the main checkout (the .worktrees/* layout) must not
+# have its handovers claimed by the parent, and vice versa.
+nested="$wt_main/.worktrees/nested"
+git -C "$wt_main" worktree add -q "$nested" -b nested
+nested_artifact="$(printf '# From a nested worktree\n' | HANDOVER_HOME="$wt_home" "$handover" save "$nested")"
+[[ "$(HANDOVER_HOME="$wt_home" "$handover" latest "$nested")" == "$nested_artifact" ]] || fail "nested worktree did not resolve to its own handover"
+[[ "$(HANDOVER_HOME="$wt_home" "$handover" latest "$wt_main")" == "$main_artifact" ]] || fail "parent checkout claimed a nested worktree's handover"
+# Same check for a pre-worktree-field artifact, where attribution has to be
+# recovered from workspace-path.
+nested_legacy="$wt_store/2020-01-02T000000Z.md"
+cat > "$nested_legacy" <<EOF
+<!-- handover-metadata
+generated: 2020-01-02T00:00:00Z
+repo: wt-main
+workspace: nested
+workspace-path: $nested
+model: legacy
+name: default
+-->
+
+# Legacy nested
+EOF
+[[ "$(HANDOVER_HOME="$wt_home" "$handover" latest "$wt_main")" == "$main_artifact" ]] || fail "parent checkout claimed a nested worktree's legacy handover"
+git -C "$wt_main" worktree remove --force "$nested"
+rm -f "$nested_legacy"
+
+# A worktree that no longer exists: its handover is still the repo's newest and
+# still resolvable, but the fallback note has to say the directory is gone.
+wt_gone="$tmp/wt-gone"
+git -C "$wt_main" worktree add -q "$wt_gone" -b gone
+gone_artifact="$(printf '# From a doomed worktree\n' | HANDOVER_HOME="$wt_home" "$handover" save "$wt_gone")"
+git -C "$wt_main" worktree remove --force "$wt_gone"
+[[ ! -d "$wt_gone" ]] || fail "fixture worktree was not removed"
+wt_fresh="$tmp/wt-fresh"
+git -C "$wt_main" worktree add -q "$wt_fresh" -b fresh
+[[ "$(HANDOVER_HOME="$wt_home" "$handover" latest "$wt_fresh" 2>/dev/null)" == "$gone_artifact" ]] || fail "a handover from a deleted worktree must still be resolvable"
+gone_note="$(HANDOVER_HOME="$wt_home" "$handover" latest "$wt_fresh" 2>&1 >/dev/null)"
+[[ "$gone_note" == *"no longer present"* ]] || fail "fallback note did not report the deleted worktree: $gone_note"
 
 bare_repo="$tmp/bare.git"
 git init -q --bare "$bare_repo"
@@ -207,7 +301,7 @@ ws_line="$(grep -n '^## Workspace state$' "$skill_md" | head -1 | cut -d: -f1)"
 [[ -n "$conv_line" && -n "$ws_line" ]] || fail "could not locate ordering anchors in SKILL.md"
 [[ "$conv_line" -lt "$ws_line" ]] || fail "Conversation state must appear before Workspace state in SKILL.md"
 
-grep -qi 'could not be reconstructed from Git' "$skill_md" \
+grep -qi 'reconstructible from Git' "$skill_md" \
   || fail "SKILL.md lost the pre-save sanity check (irrecoverable items go first)"
 
 grep -qi 'what should I tell X' "$skill_md" \
@@ -215,6 +309,13 @@ grep -qi 'what should I tell X' "$skill_md" \
 
 grep -q 'Conversation state that matters.*remain valid' "$skill_md" \
   || fail "resume drift guidance must list 'Conversation state that matters' as still-valid"
+
+# Resume has to state which worktree it resolved from; a silent cross-worktree
+# pickup hands the next agent the wrong branch and dirty tree.
+grep -qi 'current worktree' "$skill_md" \
+  || fail "SKILL.md lost the worktree-preference rule for latest"
+grep -qi 'warns on stderr' "$skill_md" \
+  || fail "SKILL.md resume guidance must surface the cross-worktree fallback warning"
 
 grep -q '^## Conversation state that matters$' "$examples_md" \
   || fail "EXAMPLES.md no longer demonstrates the conversation-state section"
