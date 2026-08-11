@@ -44,38 +44,52 @@ _wt_owner_path() {
   (( found )) && print -r -- "$main"
 }
 
-# Internal: format one repository's worktrees for the picker.
-_wt_emit_worktrees() {
-  local line wt_path head branch tag
-  while IFS= read -r -d '' line; do
-    case "$line" in
-      'worktree '*)
-        wt_path="${line#worktree }"
-        tag=$([[ "$wt_path" == */.(claude|codex)/worktrees/* ]] && print ' ⚙')
-        ;;
-      'HEAD '*) head="${line#HEAD }"; head="${head[1,7]}" ;;
-      'branch refs/heads/'*)
-        branch="${line#branch refs/heads/}"
-        print -r -- "$wt_path :: $2/$branch$tag"
-        ;;
-      detached) print -r -- "$wt_path :: $2/(detached @ $head)$tag" ;;
-    esac
-  done < <("$_WT_GIT" -C "$1" worktree list --porcelain -z 2>/dev/null)
-}
-
 # Internal: name a repository from its own MAIN worktree path ($1), never from
 # whichever directory a scan happened to enter — a base dir may be named
 # anything. Under $CODE_BASE the repo *is* the directory, so basename. Under
 # $WORKTREE_BASE the convention is <base>/<repo>/<branch>, so the first
 # component below the base names the repo: a clone rooted at
 # ~/Worktrees/keyter-canary/integration is "keyter-canary", not "integration".
+# Answers in $REPLY rather than stdout: this runs once per repository in the
+# picker's hot path, and a $(...) here costs a fork per repository.
 _wt_repo_label() {
   local main="$1" code="${CODE_BASE%/}" base="${WORKTREE_BASE%/}" rest
   case "$main" in
-    "$code"/*) print -r -- "${main:t}" ;;
-    "$base"/*) rest="${main#"$base"/}"; print -r -- "${rest%%/*}" ;;
-    *)         print -r -- "${main:t}" ;;
+    "$code"/*) REPLY="${main:t}" ;;
+    "$base"/*) rest="${main#"$base"/}"; REPLY="${rest%%/*}" ;;
+    *)         REPLY="${main:t}" ;;
   esac
+}
+
+# Internal: format one repository's worktrees for the picker, given any one of
+# its worktrees ($1). Prints the repo's MAIN worktree path on the first line,
+# then one row per worktree; returns non-zero if $1 is not in a repository.
+# Identity, label and rows all come from a SINGLE `worktree list` — the main
+# worktree is that list's first entry, so asking git separately (as an earlier
+# cut of this did) doubled the git invocations behind every picker open.
+_wt_emit_worktrees() {
+  local line wt_path head branch tag main label
+  while IFS= read -r -d '' line; do
+    case "$line" in
+      'worktree '*)
+        wt_path="${line#worktree }"
+        if [[ -z "$main" ]]; then
+          main="$wt_path"
+          _wt_repo_label "$main"; label="$REPLY"
+          print -r -- "$main"
+        fi
+        # Plain assignment, not $(...): this runs per worktree, not per repo.
+        if [[ "$wt_path" == */.(claude|codex)/worktrees/* ]]; then tag=' ⚙'; else tag=''; fi
+        ;;
+      'HEAD '*) head="${line#HEAD }"; head="${head[1,7]}" ;;
+      'branch refs/heads/'*)
+        branch="${line#branch refs/heads/}"
+        print -r -- "$wt_path :: $label/$branch$tag"
+        ;;
+      detached) print -r -- "$wt_path :: $label/(detached @ $head)$tag" ;;
+    esac
+  done < <("$_WT_GIT" -C "$1" worktree list --porcelain -z 2>/dev/null)
+  [[ -n "$main" ]]
 }
 
 # Internal: list all worktrees across all repos under $WORKTREE_BASE and $CODE_BASE.
@@ -87,7 +101,18 @@ _wt_repo_label() {
 # directories under either base point at it.
 _wt_list_all() {
   local repo_dir gitdir anchor main
+  local -a scan
   local -A seen
+
+  # Take one repository's scan output (main path on line 1, rows after) and
+  # print the rows only the first time that repository is seen.
+  _wt_take() {
+    scan=("${(@f)$(_wt_emit_worktrees "$1")}")
+    main="$scan[1]"
+    [[ -n "$main" && -z "${seen[$main]-}" ]] || return
+    seen[$main]=1
+    (( $#scan > 1 )) && print -rl -- "${(@)scan[2,-1]}"
+  }
 
   {
     # Repos reachable through $WORKTREE_BASE — git gives the full list
@@ -99,23 +124,16 @@ _wt_list_all() {
     # -print0/read -d '' so a newline in a pathname can't split a row.
     for repo_dir in "$WORKTREE_BASE"/*(N/); do
       while IFS= read -r -d '' gitdir; do
-        # Emit from the worktree we actually found, not from $main — the main
+        # Scan from the worktree we actually found, not from $main — the main
         # worktree is still listed after its directory is deleted (prunable).
-        anchor="${gitdir:h}"
-        main=$(_wt_main_path "$anchor") || continue
-        [[ -n "${seen[$main]-}" ]] && continue
-        seen[$main]=1
-        _wt_emit_worktrees "$anchor" "$(_wt_repo_label "$main")"
+        _wt_take "${gitdir:h}"
       done < <(find "$repo_dir" -name .git -maxdepth 4 -print0 2>/dev/null)
     done
 
     # Repos in $CODE_BASE not already reached above (typically no worktrees yet)
     for repo_dir in "$CODE_BASE"/*(N/); do
       [[ -d "$repo_dir/.git" || -f "$repo_dir/.git" ]] || continue
-      main=$(_wt_main_path "$repo_dir") || continue
-      [[ -n "${seen[$main]-}" ]] && continue
-      seen[$main]=1
-      _wt_emit_worktrees "$repo_dir" "$(_wt_repo_label "$main")"
+      _wt_take "$repo_dir"
     done
   } | sort -t'/' -k2
 }
@@ -157,21 +175,31 @@ _wt_open() {
 # Internal: fzf picker over all worktrees; the verb is chosen at selection time.
 # Inside a repo the query is prefilled to that repo — clear it to widen.
 _wt_picker() {
-  local out key selected wt_path repo_main
+  local out key selected wt_path repo_main rows
   local -a query
   # Repo name comes from the MAIN worktree (first `worktree list` entry), not
   # the current toplevel — inside a linked worktree the toplevel basename is
   # the worktree's dir name, and the prefilled query would match nothing.
   # Label it exactly as _wt_list_all does, or the query matches no row.
   repo_main=$(_wt_main_path "$PWD")
-  [[ -n "$repo_main" ]] && query=(--query "'$(_wt_repo_label "$repo_main")/")
-  out=$(_wt_list_all | fzf "${query[@]}" \
+  [[ -n "$repo_main" ]] && { _wt_repo_label "$repo_main"; query=(--query "'$REPLY/"); }
+  # Build the list BEFORE starting fzf; do NOT stream it in. _wt_list_all forks
+  # ~35 short-lived find/git processes, and while those compete with fzf for the
+  # CPU an arriving escape sequence can be split across fzf's reads: fzf takes
+  # the lone ESC as a bare Escape and types the rest ("[D" for Left) into the
+  # query, while a Backspace in the same window looks like it did nothing.
+  # Buffering costs ~0.3s before the picker paints and removes the race.
+  rows=$(_wt_list_all)
+  # A here-string turns "no rows" into one empty line, unlike a pipe — bail
+  # rather than show a picker holding a single blank entry.
+  [[ -z "$rows" ]] && { echo "wt: no worktrees found" >&2; return 1; }
+  out=$(fzf "${query[@]}" \
     --prompt="worktree> " \
     --header="enter: cd   ^o: VS Code   ^x: remove   ^y: copy path" \
     --expect=ctrl-o,ctrl-x,ctrl-y \
     --delimiter=' :: ' \
     --preview='git -C {1} status --short --branch 2>/dev/null' \
-    --preview-window=down,40%)
+    --preview-window=down,40% <<< "$rows")
   [[ -z "$out" ]] && return
   key=${out%%$'\n'*}
   selected=${out#*$'\n'}
@@ -262,8 +290,19 @@ _wt_rm_path() {
   done < <("$_WT_GIT" -C "$owner" worktree list --porcelain -z)
 
   echo "Removing worktree: $wt_path${branch:+ (branch: $branch)}"
-  printf "Delete branch too? [y/N] "
-  read confirm
+
+  # Drain anything already buffered from the picker before asking. A key mashed
+  # while fzf was up must not silently answer a question about deleting a branch.
+  local junk
+  while read -t 0 -k 1 junk 2>/dev/null; do :; done
+
+  # read -q (single keypress), not a bare `read`: zsh's `read` runs outside zle,
+  # so it offers no line editing — arrow keys deposit raw escape bytes that
+  # backspace cannot cleanly erase. One keypress needs no editing, and anything
+  # other than y/Y counts as no.
+  local confirm
+  if read -q "confirm?Delete branch too? [y/N] "; then confirm=y; else confirm=n; fi
+  print ""   # read -q leaves the cursor on the prompt line
 
   "$_WT_GIT" -C "$owner" worktree remove --force "$wt_path" || {
     echo "wt rm: worktree remove failed" >&2
@@ -280,8 +319,11 @@ _wt_rm_path() {
 
 # Internal: fzf picker → remove selected worktree (wt rm; skips main checkouts)
 _wt_rm() {
-  local selected
-  selected=$(_wt_list_all | fzf --prompt="remove worktree> ")
+  local selected rows
+  # Buffered before fzf starts, for the same reason as _wt_picker.
+  rows=$(_wt_list_all)
+  [[ -z "$rows" ]] && { echo "wt rm: no worktrees found" >&2; return 1; }
+  selected=$(fzf --prompt="remove worktree> " <<< "$rows")
   [[ -z "$selected" ]] && return
   _wt_rm_path "${selected%% ::*}"
 }
