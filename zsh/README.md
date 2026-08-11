@@ -108,6 +108,14 @@ checkouts immediately below `~/Code` and creates manual worktrees below
 list also discovers linked Codex and Claude Code worktrees outside those folders;
 the picker marks paths under `.codex/worktrees` or `.claude/worktrees` with `⚙`.
 
+Rows read `<repo>/<branch>`, where `<repo>` is derived from the repository's own
+main worktree — its basename below `~/Code`, or the first path component below
+`~/Worktrees` — never from the name of the directory the scan entered. A
+repository is identified by that same main worktree path, so one reachable
+through several directories (say `~/Worktrees/keyter` and `~/Code/deriul-keyter`)
+is listed once, under one label, and a clone rooted at
+`~/Worktrees/keyter-canary/integration` is labelled `keyter-canary`.
+
 Set different roots before sourcing the module if your layout differs:
 
 ```zsh

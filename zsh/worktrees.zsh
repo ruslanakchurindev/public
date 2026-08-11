@@ -63,28 +63,59 @@ _wt_emit_worktrees() {
   done < <("$_WT_GIT" -C "$1" worktree list --porcelain -z 2>/dev/null)
 }
 
-# Internal: list all worktrees across all repos under $WORKTREE_BASE and $CODE_BASE
+# Internal: name a repository from its own MAIN worktree path ($1), never from
+# whichever directory a scan happened to enter — a base dir may be named
+# anything. Under $CODE_BASE the repo *is* the directory, so basename. Under
+# $WORKTREE_BASE the convention is <base>/<repo>/<branch>, so the first
+# component below the base names the repo: a clone rooted at
+# ~/Worktrees/keyter-canary/integration is "keyter-canary", not "integration".
+_wt_repo_label() {
+  local main="$1" code="${CODE_BASE%/}" base="${WORKTREE_BASE%/}" rest
+  case "$main" in
+    "$code"/*) print -r -- "${main:t}" ;;
+    "$base"/*) rest="${main#"$base"/}"; print -r -- "${rest%%/*}" ;;
+    *)         print -r -- "${main:t}" ;;
+  esac
+}
+
+# Internal: list all worktrees across all repos under $WORKTREE_BASE and $CODE_BASE.
+# A repository is keyed by its MAIN worktree path (the first `worktree list`
+# entry), not by the name of the directory it was found in: ~/Worktrees/keyter
+# and ~/Code/deriul-keyter are the same repo, and keying on the directory name
+# emitted every one of its worktrees twice under two labels. Keying on identity
+# means each repo is emitted exactly once, under one label, however many
+# directories under either base point at it.
 _wt_list_all() {
-  local repo_dir wt_dir
+  local repo_dir gitdir anchor main
   local -A seen
 
   {
-    # Repos that have worktrees — get full list (main + worktrees) via git
+    # Repos reachable through $WORKTREE_BASE — git gives the full list
+    # (main + linked) from any one worktree of the repo. Every .git under the
+    # base dir is tried, not just the first: one base dir can hold worktrees of
+    # several repos, and `find` returns directory order, so stopping at the
+    # first hit emits an arbitrary one and silently drops the rest. Surplus
+    # hits are free — repos already listed collapse on the identity check.
+    # -print0/read -d '' so a newline in a pathname can't split a row.
     for repo_dir in "$WORKTREE_BASE"/*(N/); do
-      local repo=$(basename "$repo_dir")
-      wt_dir=$(find "$repo_dir" -name .git -maxdepth 4 -print -quit 2>/dev/null)
-      [[ -z "$wt_dir" ]] && continue
-      seen[$repo]=1
-      wt_dir=$(dirname "$wt_dir")
-      _wt_emit_worktrees "$wt_dir" "$repo"
+      while IFS= read -r -d '' gitdir; do
+        # Emit from the worktree we actually found, not from $main — the main
+        # worktree is still listed after its directory is deleted (prunable).
+        anchor="${gitdir:h}"
+        main=$(_wt_main_path "$anchor") || continue
+        [[ -n "${seen[$main]-}" ]] && continue
+        seen[$main]=1
+        _wt_emit_worktrees "$anchor" "$(_wt_repo_label "$main")"
+      done < <(find "$repo_dir" -name .git -maxdepth 4 -print0 2>/dev/null)
     done
 
-    # Repos in $CODE_BASE that have no worktrees yet — show main checkout
+    # Repos in $CODE_BASE not already reached above (typically no worktrees yet)
     for repo_dir in "$CODE_BASE"/*(N/); do
-      local repo=$(basename "$repo_dir")
-      [[ -n "${seen[$repo]-}" ]] && continue
       [[ -d "$repo_dir/.git" || -f "$repo_dir/.git" ]] || continue
-      _wt_emit_worktrees "$repo_dir" "$repo"
+      main=$(_wt_main_path "$repo_dir") || continue
+      [[ -n "${seen[$main]-}" ]] && continue
+      seen[$main]=1
+      _wt_emit_worktrees "$repo_dir" "$(_wt_repo_label "$main")"
     done
   } | sort -t'/' -k2
 }
@@ -131,8 +162,9 @@ _wt_picker() {
   # Repo name comes from the MAIN worktree (first `worktree list` entry), not
   # the current toplevel — inside a linked worktree the toplevel basename is
   # the worktree's dir name, and the prefilled query would match nothing.
+  # Label it exactly as _wt_list_all does, or the query matches no row.
   repo_main=$(_wt_main_path "$PWD")
-  [[ -n "$repo_main" ]] && query=(--query "'$(basename "$repo_main")/")
+  [[ -n "$repo_main" ]] && query=(--query "'$(_wt_repo_label "$repo_main")/")
   out=$(_wt_list_all | fzf "${query[@]}" \
     --prompt="worktree> " \
     --header="enter: cd   ^o: VS Code   ^x: remove   ^y: copy path" \
