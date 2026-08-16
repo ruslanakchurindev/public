@@ -1,0 +1,25 @@
+# GitHub identities on this machine — the single source of truth. Both the skill
+# (guidance) and gh-identity-guard.sh (enforcement) resolve through this file;
+# do not restate the mapping anywhere else.
+#
+# Four whitespace-separated columns:
+#
+#   ssh-host        the Host alias in ~/.ssh/config used by the repository's
+#                   remote — the strong signal, matched first
+#   owner           the GitHub org/user that owns the repository; the fallback
+#                   when a remote uses plain github.com
+#   gh-alias        the `gh` alias to invoke: `gh <alias> ...`
+#   expected-login  what `gh <alias> api user --jq .login` must return
+#
+# Define each alias in ~/.config/gh/config.yml so it resolves that account's own
+# token instead of the globally active one:
+#
+#   aliases:
+#     personal: '!GH_TOKEN="$(gh auth token --hostname github.com --user octocat)" gh "$@"'
+#
+# Every row below is commented out, so nothing resolves yet and the hook blocks
+# every `gh` command that could act on a repository. That is deliberate: an
+# unconfigured guard must not fall back to the active account. Uncomment and edit.
+
+#github-personal   octocat       personal   octocat
+#github-work       example-org   work       octocat-at-example

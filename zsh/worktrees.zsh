@@ -45,13 +45,10 @@ _wt_owner_path() {
 }
 
 # Internal: name a repository from its own MAIN worktree path ($1), never from
-# whichever directory a scan happened to enter — a base dir may be named
-# anything. Under $CODE_BASE the repo *is* the directory, so basename. Under
-# $WORKTREE_BASE the convention is <base>/<repo>/<branch>, so the first
-# component below the base names the repo: a clone rooted at
-# ~/Worktrees/keyter-canary/integration is "keyter-canary", not "integration".
-# Answers in $REPLY rather than stdout: this runs once per repository in the
-# picker's hot path, and a $(...) here costs a fork per repository.
+# whichever directory a scan entered. Under $CODE_BASE the repo *is* the
+# directory; under $WORKTREE_BASE the layout is <base>/<repo>/<branch>, so a
+# clone rooted at ~/Worktrees/keyter-canary/integration is "keyter-canary".
+# Answers in $REPLY: this is the picker's hot path, and $(...) forks per repo.
 _wt_repo_label() {
   local main="$1" code="${CODE_BASE%/}" base="${WORKTREE_BASE%/}" rest
   case "$main" in
@@ -63,10 +60,9 @@ _wt_repo_label() {
 
 # Internal: format one repository's worktrees for the picker, given any one of
 # its worktrees ($1). Prints the repo's MAIN worktree path on the first line,
-# then one row per worktree; returns non-zero if $1 is not in a repository.
-# Identity, label and rows all come from a SINGLE `worktree list` — the main
-# worktree is that list's first entry, so asking git separately (as an earlier
-# cut of this did) doubled the git invocations behind every picker open.
+# then one row per worktree; non-zero if $1 is not in a repository. Identity,
+# label and rows all come from a SINGLE `worktree list` (the main worktree is its
+# first entry) — asking git separately doubles the forks behind a picker open.
 _wt_emit_worktrees() {
   local line wt_path head branch tag main label
   while IFS= read -r -d '' line; do
@@ -92,13 +88,10 @@ _wt_emit_worktrees() {
   [[ -n "$main" ]]
 }
 
-# Internal: list all worktrees across all repos under $WORKTREE_BASE and $CODE_BASE.
-# A repository is keyed by its MAIN worktree path (the first `worktree list`
-# entry), not by the name of the directory it was found in: ~/Worktrees/keyter
-# and ~/Code/deriul-keyter are the same repo, and keying on the directory name
-# emitted every one of its worktrees twice under two labels. Keying on identity
-# means each repo is emitted exactly once, under one label, however many
-# directories under either base point at it.
+# Internal: list all worktrees across all repos under $WORKTREE_BASE and
+# $CODE_BASE. Keyed by MAIN worktree path, not by the directory it was found in:
+# ~/Worktrees/keyter and ~/Code/deriul-keyter are the same repo, and keying on
+# the directory name emitted every worktree twice under two labels.
 _wt_list_all() {
   local repo_dir gitdir anchor main
   local -a scan
@@ -115,17 +108,15 @@ _wt_list_all() {
   }
 
   {
-    # Repos reachable through $WORKTREE_BASE — git gives the full list
-    # (main + linked) from any one worktree of the repo. Every .git under the
-    # base dir is tried, not just the first: one base dir can hold worktrees of
-    # several repos, and `find` returns directory order, so stopping at the
-    # first hit emits an arbitrary one and silently drops the rest. Surplus
-    # hits are free — repos already listed collapse on the identity check.
-    # -print0/read -d '' so a newline in a pathname can't split a row.
+    # Every .git under the base dir, not just the first: one base dir can hold
+    # worktrees of several repos, and `find` returns directory order, so stopping
+    # at the first hit silently drops the rest. Surplus hits are free — repos
+    # already listed collapse on the identity check. -print0/read -d '' so a
+    # newline in a pathname cannot split a row.
     for repo_dir in "$WORKTREE_BASE"/*(N/); do
       while IFS= read -r -d '' gitdir; do
-        # Scan from the worktree we actually found, not from $main — the main
-        # worktree is still listed after its directory is deleted (prunable).
+        # Scan from the worktree we found, not from $main — the main worktree is
+        # still listed after its directory is deleted (prunable).
         _wt_take "${gitdir:h}"
       done < <(find "$repo_dir" -name .git -maxdepth 4 -print0 2>/dev/null)
     done
@@ -139,12 +130,10 @@ _wt_list_all() {
 }
 
 # Internal: for the repo that owns worktree $1, print its MAIN worktree path.
-# Works even when $1's own directory has been deleted (a "prunable" entry):
-# we never cd into $1, we scan the same bases _wt_list_all does and ask each
-# repo whether it lists $1. We return the repo's *main* worktree (the first
-# `worktree` entry) rather than any matching one — it always outlives the
-# removal of $1, so later `git -C` calls (branch -D) don't land on a dir that
-# `worktree remove` just deleted.
+# Never cds into $1, so it works when $1's directory is already gone (prunable):
+# scan the same bases as _wt_list_all and ask each repo whether it lists $1.
+# Returns the *main* worktree, which outlives the removal of $1 — so a later
+# `git -C` (branch -D) cannot land on a dir `worktree remove` just deleted.
 _wt_owner() {
   local target="$1" repo_dir gitdir anchor main
   for repo_dir in "$WORKTREE_BASE"/*(N/); do
@@ -177,18 +166,16 @@ _wt_open() {
 _wt_picker() {
   local out key selected wt_path repo_main rows
   local -a query
-  # Repo name comes from the MAIN worktree (first `worktree list` entry), not
-  # the current toplevel — inside a linked worktree the toplevel basename is
-  # the worktree's dir name, and the prefilled query would match nothing.
-  # Label it exactly as _wt_list_all does, or the query matches no row.
+  # Repo name from the MAIN worktree, labelled exactly as _wt_list_all does, or
+  # the prefilled query matches no row: inside a linked worktree the current
+  # toplevel basename is the worktree's own directory name.
   repo_main=$(_wt_main_path "$PWD")
   [[ -n "$repo_main" ]] && { _wt_repo_label "$repo_main"; query=(--query "'$REPLY/"); }
   # Build the list BEFORE starting fzf; do NOT stream it in. _wt_list_all forks
-  # ~35 short-lived find/git processes, and while those compete with fzf for the
-  # CPU an arriving escape sequence can be split across fzf's reads: fzf takes
-  # the lone ESC as a bare Escape and types the rest ("[D" for Left) into the
-  # query, while a Backspace in the same window looks like it did nothing.
-  # Buffering costs ~0.3s before the picker paints and removes the race.
+  # ~35 short-lived processes, and while those compete with fzf for the CPU an
+  # arriving escape sequence can be split across fzf's reads: fzf takes the lone
+  # ESC as a bare Escape and types the rest ("[D") into the query. Buffering
+  # costs ~0.3s before the picker paints and removes the race.
   rows=$(_wt_list_all)
   # A here-string turns "no rows" into one empty line, unlike a pipe — bail
   # rather than show a picker holding a single blank entry.
@@ -269,9 +256,8 @@ _wt_rm_path() {
     return 1
   }
 
-  # _wt_owner returns the repo's MAIN worktree. If that's what was picked, git
-  # would refuse ("is a main working tree") — bail early with a clear message
-  # instead of the raw fatal.
+  # _wt_owner returns the MAIN worktree. If that is what was picked, git refuses
+  # ("is a main working tree") — bail with a clear message instead.
   if [[ "$wt_path" == "$owner" ]]; then
     echo "wt rm: $wt_path is the main working tree — refusing to remove it" >&2
     return 1
@@ -297,8 +283,7 @@ _wt_rm_path() {
   while read -t 0 -k 1 junk 2>/dev/null; do :; done
 
   # read -q (single keypress), not a bare `read`: zsh's `read` runs outside zle,
-  # so it offers no line editing — arrow keys deposit raw escape bytes that
-  # backspace cannot cleanly erase. One keypress needs no editing, and anything
+  # so arrow keys deposit raw escape bytes that backspace cannot erase. Anything
   # other than y/Y counts as no.
   local confirm
   if read -q "confirm?Delete branch too? [y/N] "; then confirm=y; else confirm=n; fi
@@ -337,12 +322,8 @@ _wtsync_restore() {
     || echo "  stash kept; recover via: git stash list"
 }
 
-# Internal (wt sync): rebase current worktree onto latest origin/main, preserving uncommitted work.
-#   1. stash anything dirty (incl. untracked) with a recoverable label
-#   2. git fetch origin
-#   3. update local main in its own checkout (pull --ff-only)
-#   4. git rebase origin/main
-#   5. stash pop
+# Internal (wt sync): stash (incl. untracked) → fetch → ff local main in its own
+# checkout → rebase onto origin/main → stash pop.
 _wt_sync() {
   local root branch main_path
   root=$("$_WT_GIT" rev-parse --show-toplevel 2>/dev/null) \
@@ -399,14 +380,10 @@ _wt_sync() {
   echo "✓ $branch synced with origin/main"
 }
 
-# Internal (wt pr [commit-message]): rebase onto origin/main, push, and open a PR.
-#   wt pr              push already-committed work, then open PR
-#   wt pr "msg"        git add -A + commit "msg" + push + open PR
-# Always rebases the branch onto origin/main first. If the rebase would
-# conflict, aborts cleanly (no leftover rebase state, no conflict markers)
-# and exits — resolve manually (e.g. wt sync) and re-run wt pr.
-# If a PR already exists for the branch, opens it instead of creating a
-# duplicate.
+# Internal (wt pr [commit-message]): rebase onto origin/main, push, open a PR.
+# With a message, `git add -A` + commit first. A conflicting rebase aborts
+# cleanly (no leftover state, no markers) — resolve with wt sync and re-run. An
+# existing PR is opened rather than duplicated.
 _wt_pr() {
   local root branch msg="$1"
   root=$("$_WT_GIT" rev-parse --show-toplevel 2>/dev/null) \
@@ -416,15 +393,12 @@ _wt_pr() {
   [[ "$branch" == "main" || "$branch" == "master" ]] \
     && { echo "wt pr: refusing to open a PR from $branch"; return 1; }
 
-  # `wt pr` is the only place wt writes to GitHub, and a bare `gh` runs as whichever
-  # account is globally active — so on a machine holding more than one it can open
-  # the pull request under the wrong identity, which stays invisible until someone
-  # reads the author. Define a `wt_gh_alias` function that prints the account alias
-  # for a repository and every gh call below becomes `gh <alias> ...`; leave it
-  # undefined, as a single-account machine would, and nothing changes. Resolve it
-  # here, before anything is committed, rebased, or pushed, so a hook that cannot
-  # answer costs nothing. There is deliberately no fallback: continuing as the
-  # active account is the mistake the hook exists to prevent.
+  # A bare `gh` runs as whichever account is globally active, so on a machine
+  # holding several it opens the PR under the wrong identity — invisibly, until
+  # someone reads the author. Define a `wt_gh_alias` function and every gh call
+  # below becomes `gh <alias> ...`; leave it undefined and nothing changes.
+  # Resolved here, before anything is committed, rebased or pushed, so a failure
+  # costs nothing. No fallback: continuing as the active account is the mistake.
   local -a gh_acct
   if (( $+functions[wt_gh_alias] )); then
     local acct

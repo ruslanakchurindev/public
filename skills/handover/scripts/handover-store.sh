@@ -1,20 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Stores handover artifacts outside the repo so they never pollute git status
-# or get committed. Layout: $HANDOVER_HOME/<repo-basename>-<path-hash>/<utc>.md
-# with latest symlinks per repo. Named handovers use <name>-<utc>.md and
-# latest-<name>.md.
+# Stores handover artifacts outside the repo, at
+# $HANDOVER_HOME/<repo-basename>-<path-hash>/<utc>.md (named: <name>-<utc>.md).
 #
-# `latest` and `list` derive their answer by scanning the store, never by
-# following the latest symlinks: those track one save track each, so a named
-# save left the unnamed pointer stale and `latest` disagreed with `list`. The
-# symlinks are still written, purely as a convenience for humans browsing the
-# store. Ordering comes from the UTC stamp in the filename, not mtime, which a
-# copy or restore rewrites.
+# `latest` and `list` scan the store rather than follow the latest symlinks:
+# those track one save track each, so a named save leaves the unnamed pointer
+# stale. They are written for humans browsing the store. Ordering comes from the
+# UTC stamp in the filename, not mtime, which a copy or restore rewrites.
 #
-# Optional metadata overrides written into each artifact:
-#   HANDOVER_REPO_NAME / HANDOVER_WORKSPACE_NAME / HANDOVER_MODEL_NAME
+# Metadata overrides: HANDOVER_REPO_NAME / _WORKSPACE_NAME / _MODEL_NAME.
 
 umask 077
 
@@ -83,26 +78,21 @@ if [[ -n "$name" && "$name" == latest* ]]; then
 fi
 
 abs="$(cd "$target" && pwd)"
-# Key the store off the repository, not the working directory. Every linked
-# worktree of one repo has a distinct `--show-toplevel`, so keying off that would
-# scatter a single repo's handovers into one store per worktree -- a resume from
-# the main checkout (or a sibling worktree) then can't find them. The common git
-# dir is shared by all worktrees of a repo, so it yields one stable per-repo key.
+# Key the store off the repository, not the working directory: every linked
+# worktree has a distinct `--show-toplevel`, which would scatter one repo's
+# handovers into a store per worktree. The common git dir is shared by all of
+# them, so it yields one stable per-repo key.
 common="$(git -C "$abs" rev-parse --git-common-dir 2>/dev/null || true)"
 if [[ -n "$common" ]]; then
-  # --git-common-dir is relative to $abs in the main worktree (".git") and
-  # absolute in a linked worktree. Resolve both to the same physical path with
-  # `pwd -P`: git hands back a symlink-resolved path for a linked worktree, so
-  # the main checkout must resolve symlinks too or the two keys diverge. This
-  # also matches the old --show-toplevel form, keeping existing stores stable.
+  # Relative to $abs in the main worktree (".git"), absolute in a linked one.
+  # `pwd -P` on both: git already symlink-resolves the linked-worktree form, so
+  # the main checkout must too or the two keys diverge. This also matches the old
+  # --show-toplevel form, keeping existing stores stable.
   common="$(cd "$abs" && cd "$common" 2>/dev/null && pwd -P || printf '%s' "$common")"
   if [[ "$(basename "$common")" == ".git" ]]; then
-    # Standard layout: repo root is the parent of ".git". This equals the old
-    # --show-toplevel value for a non-worktree repo, so existing stores keep
-    # resolving; only worktrees change (now sharing the main repo's store).
     base="$(dirname "$common")"
   else
-    # Bare repo or unusual gitdir: use the common dir itself as the identity.
+    # Bare repo or unusual gitdir: the common dir itself is the identity.
     base="$common"
   fi
 else
@@ -114,11 +104,10 @@ model_name="${HANDOVER_MODEL_NAME:-unknown}"
 hash="$(printf '%s' "$base" | { shasum 2>/dev/null || sha1sum; } | cut -c1-8)"
 dir="$store_root/$(basename "$base")-$hash"
 
-# Which worktree this invocation is in. All worktrees of a repo share one store
-# (see the base resolution above), so this is what tells artifacts apart inside
-# it. Recorded on save and matched on `latest`. `workspace-path` can't serve:
-# it is the save's working directory, which may be a subdir of the worktree, and
-# it is not symlink-resolved. Empty for a bare repo or a non-repo directory.
+# All worktrees of a repo share one store, so this is what tells artifacts apart
+# inside it: recorded on save, matched on `latest`. `workspace-path` cannot serve
+# — it is the save's working directory, possibly a subdir, and not
+# symlink-resolved. Empty for a bare repo or a non-repo directory.
 worktree_root="$(git -C "$abs" rev-parse --show-toplevel 2>/dev/null || true)"
 if [[ -n "$worktree_root" && -d "$worktree_root" ]]; then
   worktree_root="$(cd "$worktree_root" && pwd -P)"
@@ -164,8 +153,8 @@ write_metadata_header() {
   printf -- '-->\n\n'
 }
 
-# Sub-second mtime, or 0 where the platform won't give one. Used only to break
-# ties, so a copy that rewrites mtimes cannot reorder distinct seconds.
+# Sub-second mtime, or 0 where the platform won't give one. Tiebreak only, so a
+# copy that rewrites mtimes cannot reorder distinct seconds.
 mtime_key() {
   local value
   value="$(stat -f '%Fm' "$1" 2>/dev/null || true)"
@@ -174,12 +163,11 @@ mtime_key() {
   printf '%s' "$value"
 }
 
-# Sort key for one artifact: "<stamp>\t<mtime>\t<collision-n>\t<path>".
-# The stamp comes from the filename and is the durable part. Two saves in the
-# same second need the tiebreaks: the -<n> counter is claimed per filename, so
-# it cannot order an unnamed save against a named one -- sub-second mtime can.
-# A file with no stamp was dropped in by hand; order it by mtime rather than
-# hide it.
+# Sort key: "<stamp>\t<mtime>\t<collision-n>\t<path>". The filename stamp is the
+# durable part; two saves in the same second need the tiebreaks, and the -<n>
+# counter is claimed per filename so it cannot order an unnamed save against a
+# named one -- sub-second mtime can. A file with no stamp was dropped in by hand:
+# order it by mtime rather than hide it.
 artifact_key() {
   local file="$1" stem ts n
   stem="$(basename "$file")"
@@ -210,8 +198,8 @@ collect_artifacts() {
   for file in "${files[@]}"; do
     base_file="$(basename "$file")"
     [[ "$base_file" == latest*.md ]] && continue
-    # For a named list the remainder after "<name>-" must be exactly a
-    # timestamp, else name "sprint" would also match "sprint-2026"'s files.
+    # The remainder after "<name>-" must be exactly a timestamp, else name
+    # "sprint" would also match "sprint-2026"'s files.
     if [[ -n "$name" ]]; then
       [[ "${base_file#"$name"-}" =~ $ts_re ]] || continue
     fi
@@ -269,12 +257,10 @@ from_this_worktree() {
     [[ "$value" == "$worktree_root" ]]
     return
   fi
-  # Written before the worktree field existed. workspace-path is the save's
-  # working directory, possibly a subdir and not symlink-resolved, so ask git
-  # which worktree owns it. A prefix test would not do: worktrees are routinely
-  # nested inside the main checkout (.worktrees/*), and the parent would then
-  # claim its children's handovers as its own. If the directory is gone there is
-  # nothing left to resolve, so leave it to the repo-wide fallback.
+  # Written before the worktree field existed. Ask git which worktree owns
+  # workspace-path; a prefix test would not do, since worktrees are routinely
+  # nested inside the main checkout and the parent would claim their handovers.
+  # A gone directory leaves nothing to resolve — use the repo-wide fallback.
   value="$(artifact_field "$file" workspace-path || true)"
   [[ -n "$value" && "$value" != unknown && -d "$value" ]] || return 1
   resolved="$(git -C "$value" rev-parse --show-toplevel 2>/dev/null || true)"
@@ -283,9 +269,9 @@ from_this_worktree() {
   [[ "$resolved" == "$worktree_root" ]]
 }
 
-# Falling back to another worktree's handover is a correct answer but not an
-# obvious one -- branch, HEAD, and uncommitted work are per-worktree. Say so on
-# stderr so stdout stays a bare path.
+# Falling back to another worktree's handover is correct but not obvious --
+# branch, HEAD and uncommitted work are per-worktree. Say so on stderr, so stdout
+# stays a bare path.
 report_fallback() {
   local file="$1" value presence
   [[ -n "$worktree_root" ]] || return 0
@@ -326,9 +312,9 @@ case "$cmd" in
     else
       file="$dir/$stamp.md"
     fi
-    # Claim the final name with a hardlink: ln fails if the target exists, so
-    # the published name only ever appears fully written and two concurrent
-    # same-second saves can never resolve to the same file.
+    # Claim the name with a hardlink: ln fails if the target exists, so the
+    # published name only appears fully written and two concurrent same-second
+    # saves can never resolve to the same file.
     n=1
     until ln "$output" "$file" 2>/dev/null; do
       n=$((n + 1))

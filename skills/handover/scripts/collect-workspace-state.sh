@@ -83,15 +83,13 @@ fi
 section "Recent commits"
 git log --oneline -5 2>/dev/null || printf 'none\n'
 
-# The PR lookup is optional and read-only. On a machine holding several GitHub
-# accounts a bare `gh` runs as whichever one is globally active, so the answer can
-# belong to the wrong account — reported as no PR, or as a 404 that reads like a
-# missing repo. HANDOVER_GH_ALIAS names the `gh` account alias to run it as
-# (`gh <alias> pr view ...`); leave it unset, as a single-account machine would,
-# and the call stays bare exactly as before. The value is validated and passed as
-# one argument, never expanded by a shell. An invalid value skips the lookup
-# rather than falling back to the bare call: that fallback would quietly query the
-# active account, which is the failure this option exists to prevent.
+# Optional and read-only. A bare `gh` runs as whichever account is globally
+# active, so on a multi-account machine the answer can belong to the wrong one —
+# reported as no PR, or as a 404 that reads like a missing repo.
+# HANDOVER_GH_ALIAS names the alias to run it as; unset, the call stays bare. The
+# value is validated and passed as one argument, never shell-expanded. An invalid
+# value skips the lookup rather than falling back to the bare call, which would
+# quietly query the active account — the failure this option exists to prevent.
 if command -v gh >/dev/null 2>&1; then
   section "Open PR for branch"
   gh_alias="${HANDOVER_GH_ALIAS:-}"

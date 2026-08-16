@@ -1,8 +1,7 @@
 # Example handover artifact
 
-A filled artifact at the expected quality bar. Note the concrete shas, exact
-commands with prerequisites, the failed approach with its real error, and the
-explicit Do NOT entries — these are what make the artifact resumable.
+A filled artifact at the expected quality bar: concrete shas, exact commands with
+prerequisites, a failed approach with its real error, explicit Do NOT entries.
 
 ```markdown
 # Handover: billing-service — webhook retry hardening
@@ -53,9 +52,8 @@ Generated: 2026-06-10T14:32:08Z | Repo: billing-service | Workspace: billing-pla
 ## Conversation state in a mixed session
 
 The artifact above omits "Conversation state that matters" — it was pure coding.
-When a session's value is reasoning (here: deciding what to tell a reviewer who
-pushed back), that block carries the irrecoverable part and sits right under
-"Resume here":
+When the session's value is reasoning instead (here: what to tell a reviewer who
+pushed back), that block sits right under "Resume here":
 
 ```markdown
 ## Conversation state that matters

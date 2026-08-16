@@ -1,23 +1,21 @@
 # Handover
 
-An agent skill that packages a working session into a curated, portable handover
-artifact — and loads the latest one to pick up where you left off.
+An agent skill that packages a working session into a curated, portable artifact
+— and loads the latest one to pick up where you left off.
 
 The hard part of a handover is not workspace state; the next agent can re-run
 `git status` itself. The irrecoverable part is **conversation state**: decisions
-and their rationale, rejected alternatives, constraints the user voiced, and dead
-ends already explored. This skill captures those in human-readable markdown stored
-outside the repo, and lets deterministic scripts capture the recoverable rest.
-
-## Modes
+and their rationale, rejected alternatives, constraints the user voiced, dead ends
+already explored. This skill captures those in markdown stored outside the repo,
+and lets scripts capture the recoverable rest.
 
 - **Produce** (default) — package the current session into one markdown artifact.
 - **Resume** — load the latest artifact for the current repo, summarize the pickup
-  point, and wait for you to say to continue.
+  point, and wait.
 
 ## Command surface
 
-The scripts do the deterministic work; the skill body (`SKILL.md`) drives them.
+The scripts do the deterministic work; `SKILL.md` drives them.
 
 ```bash
 scripts/handover.sh path .                  # print (and create) the store dir
@@ -27,84 +25,78 @@ scripts/handover.sh list .                  # list artifact paths, newest first
 scripts/handover.sh state . [since-ref]     # print workspace snapshot
 ```
 
-`latest` and `list` derive their answer by scanning the store: every artifact is
-considered, named or not, ordered by the UTC stamp in its filename rather than by
-mtime or by the `latest*.md` symlinks. Those symlinks are still written but are
-informational — each tracks only its own save track, so following one would return
-a stale answer as soon as the next save used a different name.
+`latest` and `list` scan the store — every artifact, named or not, ordered by the
+UTC stamp in its filename rather than by mtime or by the `latest*.md` symlinks.
+Those symlinks are written for convenience only: each tracks one save track, so
+following one goes stale as soon as the next save uses a different name.
 
-`latest` prefers the newest artifact produced in the **current worktree**. When that
-worktree has none, it falls back to the repo's newest and prints a note on stderr
-naming the originating worktree and whether that directory still exists; stdout stays
-a bare path.
+`latest` prefers the newest artifact produced in the **current worktree**. With
+none there it falls back to the repo's newest and notes on stderr which worktree
+produced it and whether that directory still exists; stdout stays a bare path.
 
-Use `--name NAME` with `save`, `latest`, or `list` only when several workstreams in
-the same repo need separate threads. `NAME` must be 1–64 characters starting
-with a letter or digit, then letters, digits, dots, underscores, or hyphens; names
-starting with `latest` are reserved. `--name` is an explicit thread selector, so it
-narrows to that thread and skips the worktree preference.
+`--name NAME` works with `save`, `latest` and `list`, for several workstreams in
+one repo. `NAME` is 1–64 characters starting with a letter or digit, then letters,
+digits, dots, underscores or hyphens; names starting with `latest` are reserved.
+Being an explicit thread selector, it skips the worktree preference.
 
 ## Configuration
 
-All optional environment variables:
+All optional:
 
-- `HANDOVER_HOME` — root for stored artifacts (default `~/.handovers/`).
-- `HANDOVER_REPO_NAME` — override the detected repo name in artifact metadata.
-- `HANDOVER_WORKSPACE_NAME` — override the detected workspace name.
-- `HANDOVER_MODEL_NAME` — override the detected model name.
-- `HANDOVER_GH_ALIAS` — account alias for the optional open-PR lookup in `state`.
+| Variable | Purpose |
+|----------|---------|
+| `HANDOVER_HOME` | root for stored artifacts (default `~/.handovers/`) |
+| `HANDOVER_REPO_NAME` | override the detected repo name in artifact metadata |
+| `HANDOVER_WORKSPACE_NAME` | override the detected workspace name |
+| `HANDOVER_MODEL_NAME` | override the detected model name |
+| `HANDOVER_GH_ALIAS` | `gh` account alias for the open-PR lookup in `state` |
 
-`HANDOVER_GH_ALIAS` exists for machines that hold more than one GitHub account and
-reach each through a `gh` alias. A bare `gh` runs as whichever account is globally
-active, so the open-PR line can answer for the wrong account — reported as no PR, or
-as a 404 that reads like a missing repository. Set the variable to the alias for the
-repository being snapshotted and the lookup runs as `gh <alias> pr view ...`:
+`HANDOVER_GH_ALIAS` matters on a machine holding several GitHub accounts: a bare
+`gh` runs as whichever is active, so the lookup can answer for the wrong one —
+reported as no PR, or as a 404 that reads like a missing repository.
 
 ```bash
 HANDOVER_GH_ALIAS=work scripts/handover.sh state .
 ```
 
-Leave it unset on a single-account machine — the default — and the call stays bare,
-unchanged. The value must be 1–64 characters starting with a letter or digit, then
-letters, digits, dots, underscores, or hyphens; it is passed to `gh` as a single
-argument and never expanded by a shell. An invalid value skips the lookup and says
-so rather than falling back to the bare call, since that fallback would silently
-query the active account. The lookup stays read-only and optional either way: no
-open pull request still prints `none`, and nothing else in the snapshot depends on it.
+Leave it unset on a single-account machine and the call stays bare. The value has
+the same character rules as `--name`, is passed to `gh` as one argument, and is
+never expanded by a shell. An invalid value skips the lookup and says so rather
+than falling back to the bare call. The lookup is read-only and optional either
+way.
+
+## Store layout
 
 Artifacts live under `<HANDOVER_HOME>/<repo-basename>-<path-hash>/` with private
-permissions (directories `700`, files `600`).
+permissions (directories `700`, files `600`). Keep `HANDOVER_HOME` on a private,
+non-shared path — the store is not hardened against a symlinked or world-writable
+location.
 
-Keep `HANDOVER_HOME` on a private, non-shared path — the store is not hardened against
-a symlinked or world-writable location. The `<path-hash>` is derived from the
-repository's shared git directory, so **all linked worktrees of one repo share a single
-store** — a handover saved in a worktree is found by `latest`/`list` from the main
-checkout or any sibling worktree, and the metadata's `worktree` field records which
-worktree produced it. Concurrent worktrees need no coordination: each resolves to its
-own newest handover, and a worktree you later delete leaves its handovers findable from
-anywhere else in the repo. Moving the repo directory starts a fresh store; earlier
-handovers remain under the old path and can be recovered by moving that directory to
+The `<path-hash>` comes from the repository's shared git directory, so **all
+linked worktrees of one repo share one store**: a handover saved in a worktree is
+found from the main checkout or any sibling, the metadata's `worktree` field
+records which one produced it, and a deleted worktree leaves its handovers
+findable elsewhere. Moving the repo directory starts a fresh store; earlier
+handovers stay under the old path and can be recovered by moving that directory to
 the new hash printed by `handover.sh path .`.
 
 ## Privacy
 
-Handover artifacts are curated summaries, not recordings. By design the skill
-instructs the agent **not** to capture raw transcripts, secrets, `.env` values,
-tokens, or tool session IDs. Artifacts are written outside the repo with private
-permissions (directories `700`, files `600`) enforced by the save script.
+Artifacts are curated summaries, not recordings. The skill instructs the agent
+**not** to capture raw transcripts, secrets, `.env` values, tokens, or tool session
+IDs.
 
 ## Install
 
-Install through your agent's skill mechanism, or symlink this `skills/handover/`
-directory into your agent's skill directory rather than copying it — keep one source
-copy so `SKILL.md`, the scripts, and `EXAMPLES.md` don't drift.
+Install through your agent's skill mechanism, or symlink this directory into the
+agent's skill directory rather than copying it, so `SKILL.md`, the scripts and
+`EXAMPLES.md` cannot drift.
 
-Requires `bash`, `git`, and a SHA-1 tool (`shasum` on macOS, `sha1sum` on Linux)
-for the per-repo store path. GitHub CLI (`gh`) is optional, used only for open-PR
-lookup in workspace snapshots.
+Requires `bash`, `git`, and a SHA-1 tool (`shasum` or `sha1sum`). The GitHub CLI is
+optional, used only for the open-PR lookup.
 
-Run the tests with `GIT_CONFIG_GLOBAL=/dev/null scripts/test-handover.sh` — the
-override keeps a contributor's global git config out of the fixtures.
+Tests: `GIT_CONFIG_GLOBAL=/dev/null scripts/test-handover.sh` — the override keeps
+a contributor's global git config out of the fixtures.
 
 ## License
 

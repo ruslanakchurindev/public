@@ -1,41 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Reconcile agent skill links from the declarative manifest.
+# Reconcile agent skill links from the manifest. See usage() below and README.md.
 #
-# Reads the manifest and, for each entry, symlinks the skill (absolute path)
-# into the appropriate targets:
-#   - user            -> every detected agent skills root
-#   - project:<repo>  -> <repo>/{.claude,.codex}/skills
+#   user            -> every detected agent skills root
+#   project:<repo>  -> <repo>/{.claude,.codex}/skills
 #
-# Idempotent and prune-safe: it records exactly which links it created (in a
-# machine-local state file) and, on the next run, removes only the links it
-# previously created that are no longer in the manifest. It never touches
-# skills it did not create (e.g. Codex's .system/, or anything dropped in by
-# hand).
+# Idempotent and prune-safe: it records the links it creates in a state file and
+# later prunes only those, never a skill it did not create.
 #
-# Reports only what changed, so a converged run is one summary line. That makes
-# it safe to call from a shell hook or a login script; -q drops even the summary.
-#
-# Usage:
-#   sklink-sync [-n] [-v] [-q]
-#     -n, --dry-run    report what would change, change nothing
-#     -v, --verbose    list every link, not just the ones that changed
-#     -q, --quiet      print nothing but warnings
-#   sklink-sync --print-roots   list the detected user-wide roots, then exit
-#   sklink-sync --print-plan    list every link the manifest asks for, as
-#                               "<link-path><TAB><source>", then exit
-#
-# `sklink sync` runs this. The two --print- modes are what `sklink doctor`
-# consumes, so root detection and link derivation live in exactly one place —
-# doctor checks the links this script would really make, not a second guess.
-#
-# Environment:
-#   SKLINK_MANIFEST   manifest path (default: $XDG_CONFIG_HOME/sklink/manifest)
-#   SKLINK_ROOTS      space-separated user-wide roots, replacing autodetection
-#   XDG_CONFIG_HOME   default $HOME/.config
-#   XDG_STATE_HOME    default $HOME/.local/state
-#   NO_COLOR          set to disable colour
+# --print-roots / --print-plan are what `sklink doctor` consumes, so root
+# detection and link derivation live here only — doctor checks the links this
+# script would really make, not a second guess.
 
 self="${0##*/}"
 config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
@@ -68,10 +44,8 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-# Colour is presentation only: every escape is defined here and nowhere else, so
-# the reporting below stays readable. stdout and stderr are decided separately
-# because `sklink sync > log` still has a terminal on stderr. (This block is
-# duplicated in the CLI on purpose — each script has to stand alone.)
+# stdout and stderr decided separately: `sklink sync > log` still has a terminal
+# on stderr. Duplicated in the CLI on purpose — each script has to stand alone.
 if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-}" != "dumb" ]]; then
   c_bold=$'\033[1m'; c_dim=$'\033[2m'; c_green=$'\033[32m'; c_yellow=$'\033[33m'; c_off=$'\033[0m'
 else
@@ -85,9 +59,8 @@ fi
 
 expand_tilde() { printf '%s' "${1/#\~/$HOME}"; }
 
-# Literal prefix comparison, not pattern substitution — see the longer note in
-# the CLI: ${p/#$HOME/~} expands $HOME as a glob and can collapse a path that
-# merely resembles home. Display only; nothing here is written back.
+# Literal prefix comparison: ${p/#$HOME/~} would expand $HOME as a glob and can
+# collapse a path that merely resembles home. Display only.
 collapse_home() {
   local p="$1"
   if [[ "$p" == "$HOME" ]]; then printf '~'
@@ -96,9 +69,7 @@ collapse_home() {
   fi
 }
 
-# --print-plan answers a question rather than doing anything, so it stays silent:
-# `sklink doctor` reports the same conditions in its own words and would
-# otherwise print each one twice.
+# Silent under --print-plan: doctor reports the same conditions in its own words.
 warn() {
   [[ "$mode" == "plan" ]] && return 0
   printf '%swarning:%s %s\n' "$e_warn" "$e_off" "$*" >&2
@@ -107,9 +78,8 @@ warn() {
 say() { [[ "$quiet" == 1 ]] || printf '%s\n' "$*"; return 0; }
 plural() { [[ "$1" == 1 ]] || printf 's'; return 0; }
 
-# --- discover user-wide agent skill roots ---
-# "<agent-home>|<skills-root>"; a root is used only if its agent home exists,
-# so installing or removing an agent needs no change here.
+# "<agent-home>|<skills-root>"; a root is used only if its agent home exists, so
+# installing or removing an agent needs no change here.
 default_candidates=(
   "$HOME/.claude|$HOME/.claude/skills"
   "$HOME/.codex|$HOME/.codex/skills"
@@ -141,9 +111,8 @@ fi
 state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/sklink"
 state_file="$state_dir/managed.tsv"
 
-# Per-repo subdirectories that receive project-scoped skills. Unlike the user
-# roots above these can't be auto-detected (an agent leaves no marker in a repo
-# it hasn't been used in yet), so the list is explicit.
+# Explicit, unlike the user roots: an agent leaves no marker in a repo it has not
+# been used in yet, so there is nothing to detect.
 project_subdirs=(".claude/skills" ".codex/skills")
 
 status=0
@@ -152,21 +121,20 @@ src_missing=0
 n_skills=0; n_links=0; n_new=0; n_retarget=0; n_same=0; n_pruned=0; n_unknown=0
 n_user_entries=0
 
-# The link path is the news; the source is only worth the width when the link
-# just changed where it points, or when you asked to see everything.
+# Show the source only when the link changed target, or under -v.
 report() {  # <marker> <colour> <link-path> <source>
   local arrow=""
   if [[ "$verbose" == 1 || "$1" == "~" ]]; then arrow=" -> $(collapse_home "$4")"; fi
   say "$(printf '  %s%s%s %s%s%s%s' "$2" "$1" "$c_off" "$c_dim" "$(collapse_home "$3")" "$arrow" "$c_off")"
 }
 
-# The source is gone, so there is nothing to relink — but a link we made earlier
-# stays under management. Dropping it from the state file would orphan it:
-# doctor would stop reporting it and a later `sklink rm` could never prune it.
+# Source gone, nothing to relink — but keep the link under management. Dropping
+# it from the state file would orphan it: doctor stops reporting it, and a later
+# `sklink rm` could never prune it.
 keep_managed() {
-  # Explicit 0: a bare `return` hands back the status of the test, and a false
-  # one aborts the whole run under `set -e` — before the prune and before the
-  # state file is written. Every early return in this script says 0.
+  # Explicit `return 0`, as everywhere here: a bare `return` hands back the
+  # test's status, and a false one aborts the run under `set -e` — before the
+  # prune and before the state file is written.
   [[ -L "$1/$2" ]] && created+="$1	$2"$'\n'
   return 0
 }
@@ -180,9 +148,9 @@ link_one() {
     status=1; return 0
   fi
 
-  # A root we are not allowed to look inside makes every test below read false,
-  # so a dry run would announce links that are already there. A real run finds
-  # out honestly (the ln fails and warns); a dry run has to say it cannot tell.
+  # An unreadable root makes every test below read false, so a dry run would
+  # announce links that are already there. A real run finds out honestly (ln
+  # fails and warns); a dry run has to say it cannot tell.
   if [[ "$dry" == 1 && -d "$root" && ! -r "$root" ]]; then
     created+="$root	$name"$'\n'
     n_links=$((n_links + 1)); n_unknown=$((n_unknown + 1))
@@ -190,8 +158,7 @@ link_one() {
     return 0
   fi
 
-  # Classify before touching anything: it is what lets a converged run say
-  # "up to date" instead of replaying every link it did not change.
+  # Classify before touching anything, so a converged run can say "up to date".
   if [[ -L "$link_path" ]]; then
     current="$(readlink "$link_path")"
     if [[ "$current" == "$src" ]]; then action="same"; else action="retarget"; fi
@@ -200,16 +167,15 @@ link_one() {
   fi
 
   if [[ "$action" != "same" && "$dry" == 0 ]]; then
-    # One unwritable target must not abort the whole reconcile: a failed
-    # mkdir/ln degrades to a warning + status=1 so the prune and the state
-    # write still happen and the remaining entries are still processed.
+    # One unwritable target must not abort the reconcile: degrade to a warning
+    # so the prune, the state write, and the remaining entries still happen.
     if ! mkdir -p "$root" 2>/dev/null; then
       warn "cannot create skills root: $(collapse_home "$root")"
       status=1; return 0
     fi
-    # -n (BSD: -h) is what makes this safe to repeat: without it, ln follows an
-    # existing symlink-to-a-directory and drops the new link *inside* the skill
-    # folder instead of replacing the pointer.
+    # -n is what makes this repeatable: without it, ln follows an existing
+    # symlink-to-a-directory and drops the new link *inside* the skill folder
+    # instead of replacing the pointer.
     if ! ln -sfn "$src" "$link_path" 2>/dev/null; then
       warn "cannot link $(collapse_home "$link_path") -> $(collapse_home "$src")"
       status=1
@@ -228,8 +194,8 @@ link_one() {
   return 0
 }
 
-# In plan mode every target is printed instead of created. Both modes walk the
-# same manifest through the same target derivation, which is the point.
+# Plan mode prints each target instead of creating it — same manifest walk, same
+# target derivation, which is the point.
 target_one() {
   if [[ "$mode" == "plan" ]]; then printf '%s/%s\t%s\n' "$1" "$2" "$3"
   elif [[ "$src_missing" == 1 ]]; then keep_managed "$1" "$2"
@@ -245,17 +211,16 @@ while read -r scope name src _rest || [[ -n "${scope:-}" ]]; do
     warn "skipping malformed manifest line near: $scope ${name:-}"
     status=1; continue
   fi
-  # A source path with a space in it parses as source + trailing junk, which
-  # would otherwise link a directory nobody asked for, silently. A trailing
-  # comment is a normal thing to write, so that one stays quiet.
+  # A space in a source path parses as source + junk, silently linking a
+  # directory nobody asked for. A trailing comment is normal, so it stays quiet.
   case "${_rest:-}" in
     ""|\#*) ;;
     *) warn "ignoring extra text after the source for $name (a source path cannot contain spaces)";;
   esac
   src="$(expand_tilde "$src")"
   n_skills=$((n_skills + 1))
-  # Checked once per skill rather than once per target: a missing source is one
-  # fact about the manifest, not one fact per agent root.
+  # Once per skill, not per target: a missing source is one fact about the
+  # manifest, not one per agent root.
   src_missing=0
   if [[ ! -d "$src" ]]; then
     warn "source not found for $name: $(collapse_home "$src")"
@@ -264,14 +229,13 @@ while read -r scope name src _rest || [[ -n "${scope:-}" ]]; do
 
   if [[ "$scope" == "user" ]]; then
     n_user_entries=$((n_user_entries + 1))
-    # ${a[@]+"${a[@]}"}: an empty array under `set -u` is an error in bash 3.2,
-    # and "no agent installed yet" must be a no-op, not a crash.
+    # ${a[@]+"${a[@]}"}: bash 3.2 errors on an empty array under `set -u`, and
+    # "no agent installed yet" must be a no-op, not a crash.
     for root in ${user_roots[@]+"${user_roots[@]}"}; do target_one "$root" "$name" "$src"; done
   elif [[ "$scope" == project:* ]]; then
     repo="$(expand_tilde "${scope#project:}")"
-    # Without this guard a stale scope (a repo since renamed or deleted) would
-    # be silently conjured back into existence by the mkdir -p in link_one,
-    # leaving a phantom repo containing nothing but .claude/skills.
+    # Without this, a stale scope (repo renamed or deleted) is conjured back by
+    # the mkdir -p in link_one, as a phantom repo holding only .claude/skills.
     if [[ ! -d "$repo" ]]; then
       warn "project repo not found for $name: $(collapse_home "$repo")"
       status=1; continue
@@ -299,7 +263,6 @@ if [[ -f "$state_file" ]]; then
   done < "$state_file"
 fi
 
-# --- persist what we manage now ---
 # A dry run must leave no trace: writing state here would make the next real run
 # believe links exist that were never created.
 if [[ "$dry" == 0 ]]; then
@@ -310,14 +273,14 @@ if [[ "$dry" == 0 ]]; then
   }
 fi
 
-# --- one-line summary: what the manifest holds, and what actually moved ---
+# --- summary: what the manifest holds, and what actually moved ---
 changes=""
 [[ "$n_new" -gt 0 ]]      && changes="${changes:+$changes, }$n_new new"
 [[ "$n_retarget" -gt 0 ]] && changes="${changes:+$changes, }$n_retarget retargeted"
 [[ "$n_pruned" -gt 0 ]]   && changes="${changes:+$changes, }$n_pruned pruned"
 
-# No agent installed yet is a normal state on a fresh machine, not a failure —
-# but "up to date" is a baffling answer to `add`, so it gets its own verdict.
+# No agent installed yet is normal on a fresh machine, not a failure — but "up to
+# date" is a baffling answer to `add`, so it gets its own verdict.
 no_roots=0
 [[ "${#user_roots[@]}" == 0 && "$n_user_entries" -gt 0 ]] && no_roots=1
 
@@ -339,8 +302,7 @@ if [[ "$dry" == 1 && $((n_new + n_retarget + n_pruned)) -gt 0 ]]; then
   say "$(printf '%sdry run — nothing was changed%s' "$c_dim" "$c_off")"
 fi
 
-# Name the directories detection actually looked in, built from the same list,
-# so the advice can never drift from the candidates.
+# Built from the same candidate list, so the advice cannot drift from it.
 if [[ "$no_roots" == 1 ]]; then
   homes=""
   for cand in "${default_candidates[@]}"; do homes="${homes:+$homes, }$(collapse_home "${cand%%|*}")"; done
