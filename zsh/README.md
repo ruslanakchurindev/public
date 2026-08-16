@@ -144,6 +144,36 @@ Picker keys:
 | `ctrl-x` | Remove the selected worktree. |
 | `ctrl-y` | Copy the selected path, or print it if `pbcopy` is unavailable. |
 
+### Choosing a GitHub account
+
+`wt pr` is the only command that talks to GitHub, and a bare `gh` acts as whichever
+account is currently active. On a machine holding one GitHub account that is always
+right and nothing below applies. On a machine holding several it is usually wrong:
+the pull request opens under the wrong identity, and nothing says so until someone
+reads the author.
+
+Define a `wt_gh_alias` function to say which account a repository belongs to. It
+receives the repository root and prints the `gh` account alias to use:
+
+```zsh
+wt_gh_alias() {
+  case "$(command git -C "$1" remote get-url origin)" in
+    *github.com:my-org/*) print -r -- work ;;
+    *) print -r -- personal ;;
+  esac
+}
+```
+
+Every `gh` call in `wt pr` then runs as `gh <alias> ...`. Leave the function
+undefined — the default — and the calls stay bare, exactly as before.
+
+The alias must be 1–64 characters starting with a letter or digit, then letters,
+digits, dots, underscores, or hyphens. `wt pr` resolves it before it commits,
+rebases, or pushes anything, so a hook that fails or answers with something else
+stops the command immediately and costs nothing. There is deliberately no fallback
+to a bare `gh`: opening a pull request as the wrong account is the mistake the hook
+exists to prevent.
+
 ### Safety notes
 
 - `wt rm` refuses to remove a repository's main working tree. It does use

@@ -20,6 +20,9 @@ mode_of() {
 # Explicit template: BSD mktemp ignores $TMPDIR for the bare `mktemp -d` form,
 # which strands the suite in sandboxes that only allow a specific temp root.
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/handover-test.XXXXXX")"
+# Resolve it: on macOS /tmp and /var are symlinks, and Git reports the physical
+# path, so fixtures built from the logical one never match the recorded metadata.
+tmp="$(cd "$tmp" && pwd -P)"
 trap 'rm -rf "$tmp"' EXIT
 
 repo="$tmp/repo"
@@ -281,6 +284,72 @@ state_output="$(HANDOVER_HOME="$home" "$handover" state "$repo")"
 [[ "$state_output" == *"## Git"* ]] || fail "state output missing git section"
 [[ "$state_output" == *"repo: $repo_root"* ]] || fail "state output missing repo path"
 
+# --- Open-PR lookup ----------------------------------------------------------
+# On a machine holding several GitHub accounts a bare `gh` runs as whichever one is
+# globally active, so the open-PR line can answer for the wrong account — reported
+# as no PR, or as a 404 that reads like a missing repo. When the caller names an
+# account, that name has to reach `gh` and no bare call may survive.
+gh_bin="$tmp/gh-bin"
+gh_log="$tmp/gh.log"
+mkdir -p "$gh_bin"
+cat > "$gh_bin/gh" <<'FAKE_GH'
+#!/usr/bin/env bash
+printf 'gh %s\n' "$*" >> "$GH_LOG"
+if [[ "${GH_FIXTURE:-pr}" == "no-pr" ]]; then
+  printf 'no pull requests found for branch "main"\n' >&2
+  exit 1
+fi
+printf 'Fixture PR (OPEN) https://example.invalid/pr/1\n'
+FAKE_GH
+chmod +x "$gh_bin/gh"
+
+pr_line() {
+  awk '/^## Open PR for branch$/ { getline; print; exit }'
+}
+
+# Default single-account path: no alias supplied, so the call stays bare.
+: > "$gh_log"
+default_pr="$(PATH="$gh_bin:$PATH" GH_LOG="$gh_log" HANDOVER_HOME="$home" "$handover" state "$repo" | pr_line)"
+[[ "$default_pr" == *"Fixture PR (OPEN)"* ]] || fail "default path did not report the PR: $default_pr"
+grep -q '^gh pr view --json title,state,url ' "$gh_log" || fail "default path did not run a bare gh pr view"
+
+# A supplied alias must precede `pr view`, and no bare call may survive.
+: > "$gh_log"
+alias_pr="$(PATH="$gh_bin:$PATH" GH_LOG="$gh_log" HANDOVER_HOME="$home" HANDOVER_GH_ALIAS=fixture-acct "$handover" state "$repo" | pr_line)"
+[[ "$alias_pr" == *"Fixture PR (OPEN)"* ]] || fail "aliased path did not report the PR: $alias_pr"
+grep -q '^gh fixture-acct pr view --json title,state,url ' "$gh_log" \
+  || fail "supplied alias did not precede pr view: $(cat "$gh_log")"
+if grep -q '^gh pr view' "$gh_log"; then
+  fail "a bare gh pr view ran even though an account alias was supplied"
+fi
+
+# No open pull request still degrades to `none`, aliased or not.
+: > "$gh_log"
+none_pr="$(PATH="$gh_bin:$PATH" GH_LOG="$gh_log" GH_FIXTURE=no-pr HANDOVER_HOME="$home" HANDOVER_GH_ALIAS=fixture-acct "$handover" state "$repo" | pr_line)"
+[[ "$none_pr" == "none" ]] || fail "no open PR should print none, got: $none_pr"
+
+# An invalid alias skips the lookup and says so. Falling back to a bare `gh` would
+# silently query the active account — the failure this option exists to prevent.
+: > "$gh_log"
+bad_state="$(PATH="$gh_bin:$PATH" GH_LOG="$gh_log" HANDOVER_HOME="$home" HANDOVER_GH_ALIAS='fixture acct; id' "$handover" state "$repo")"
+[[ "$(printf '%s\n' "$bad_state" | pr_line)" == skipped:* ]] || fail "invalid HANDOVER_GH_ALIAS was not reported as skipped"
+[[ "$bad_state" == *"## Git"* ]] || fail "invalid HANDOVER_GH_ALIAS broke the rest of the snapshot"
+[[ ! -s "$gh_log" ]] || fail "invalid HANDOVER_GH_ALIAS still invoked gh: $(cat "$gh_log")"
+
+# Without gh the section is omitted rather than failing the snapshot. PATH keeps
+# only what the script itself needs, so `command -v gh` genuinely finds nothing.
+nogh_bin="$tmp/nogh-bin"
+mkdir -p "$nogh_bin"
+for cmd in env bash dirname git date find sed sort awk; do
+  cmd_path="$(command -v "$cmd" || true)"
+  if [[ -n "$cmd_path" ]]; then
+    ln -sf "$cmd_path" "$nogh_bin/$cmd"
+  fi
+done
+nogh_state="$(PATH="$nogh_bin" HANDOVER_HOME="$home" "$handover" state "$repo")"
+[[ "$nogh_state" == *"## Git"* ]] || fail "state without gh lost the git section"
+[[ "$nogh_state" != *"## Open PR for branch"* ]] || fail "state without gh still emitted the PR section"
+
 # --- Skill documentation contract -------------------------------------------
 # The skill's whole point is preserving irrecoverable conversation state, not
 # repo mechanics the next agent can re-derive. These checks lock that contract
@@ -289,8 +358,15 @@ state_output="$(HANDOVER_HOME="$home" "$handover" state "$repo")"
 skill_root="$(cd "$script_dir/.." && pwd)"
 skill_md="$skill_root/SKILL.md"
 examples_md="$skill_root/EXAMPLES.md"
+readme_md="$skill_root/README.md"
 [[ -f "$skill_md" ]] || fail "SKILL.md not found at $skill_md"
 [[ -f "$examples_md" ]] || fail "EXAMPLES.md not found at $examples_md"
+[[ -f "$readme_md" ]] || fail "README.md not found at $readme_md"
+
+# An account-selection option nobody knows about is the same as not having one:
+# the caller has to be told to pass it, or the bare-gh default silently returns.
+grep -q 'HANDOVER_GH_ALIAS' "$readme_md" || fail "README.md must document HANDOVER_GH_ALIAS"
+grep -q 'HANDOVER_GH_ALIAS' "$skill_md" || fail "SKILL.md must tell the agent to set HANDOVER_GH_ALIAS"
 
 grep -q '^## Conversation state that matters$' "$skill_md" \
   || fail "SKILL.md output format lost the 'Conversation state that matters' section"

@@ -29,7 +29,9 @@ zsh -n "$caffeinate_script"
 zsh -n "$gpull_script"
 zsh -n "$worktrees_script"
 
-tmp="$(mktemp -d)"
+# Explicit template: BSD mktemp ignores $TMPDIR for the bare `mktemp -d` form,
+# which strands the suite in sandboxes that only allow a specific temp root.
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/zsh-test.XXXXXX")"
 tmp="$(cd "$tmp" && pwd -P)"
 cleanup() {
   if [[ -n "${gpull_unreadable_base:-}" && -d "$gpull_unreadable_base" ]]; then
@@ -466,7 +468,7 @@ GIT_CONFIG_GLOBAL=/dev/null git -C "$upstream" config user.email "zsh-test@examp
 mkdir "$fake_bin"
 real_git="$(command -v git)"
 printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\\n" "$*" >> "$WT_GIT_LOG"' 'exec "$REAL_GIT" "$@"' > "$fake_git"
-printf '%s\n' '#!/usr/bin/env bash' 'printf "gh %s\\n" "$*" >> "$WT_GH_LOG"' 'if [[ "$1 $2" == "pr view" ]]; then' '  [[ "${GH_MODE:-create}" == view ]] && { printf "https://example.invalid/pr/1\\n"; exit 0; }' '  exit 1' 'fi' 'if [[ "$1 $2" == "pr create" ]]; then printf "https://example.invalid/pr/1\\n"; exit 0; fi' 'exit 1' > "$fake_bin/gh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "gh %s\\n" "$*" >> "$WT_GH_LOG"' 'if [[ "$1" != pr ]]; then shift; fi' 'if [[ "$1 $2" == "pr view" ]]; then''  [[ "${GH_MODE:-create}" == view ]] && { printf "https://example.invalid/pr/1\\n"; exit 0; }' '  exit 1' 'fi' 'if [[ "$1 $2" == "pr create" ]]; then printf "https://example.invalid/pr/1\\n"; exit 0; fi' 'exit 1' > "$fake_bin/gh"
 chmod +x "$fake_git" "$fake_bin/gh"
 
 WT_SCRIPT="$worktrees_script" \
@@ -595,6 +597,61 @@ if grep -E -- 'push (--force-with-lease|-u origin)' "$WT_GIT_LOG" >/dev/null; th
   print -u2 'unchanged tracked branch used a non-default push path'
   exit 1
 fi
+grep -F -- 'gh pr view --json url -q .url' "$WT_GH_LOG" >/dev/null || exit 1
+
+# An account hook, once the user defines one, has to name the account on every gh
+# call. A bare `gh` runs as whichever account is globally active — that is how a
+# personal pull request ends up authored by a work account.
+wt_gh_alias() { print -r -- fixture-acct; }
+
+export GH_MODE=view
+: > "$WT_GH_LOG"
+_wt_pr >/dev/null || exit 1
+grep -F -- 'gh fixture-acct pr view --json url -q .url' "$WT_GH_LOG" >/dev/null || exit 1
+if grep -E -- '^gh pr ' "$WT_GH_LOG" >/dev/null; then
+  print -u2 'wt pr looked up the PR through a bare gh despite wt_gh_alias'
+  exit 1
+fi
+
+# The create path is the one that writes, so it matters most.
+export GH_MODE=create
+: > "$WT_GH_LOG"
+_wt_pr >/dev/null || exit 1
+grep -F -- 'gh fixture-acct pr create --fill' "$WT_GH_LOG" >/dev/null || exit 1
+if grep -E -- '^gh pr ' "$WT_GH_LOG" >/dev/null; then
+  print -u2 'wt pr created the PR through a bare gh despite wt_gh_alias'
+  exit 1
+fi
+
+# A hook that cannot answer stops wt pr before it touches the repo or GitHub;
+# continuing as the active account is the write this path exists to prevent.
+wt_gh_alias() { print -r -- 'not an alias'; }
+: > "$WT_GH_LOG"
+: > "$WT_GIT_LOG"
+if _wt_pr >/dev/null 2>&1; then
+  print -u2 'wt pr accepted an invalid account alias'
+  exit 1
+fi
+[[ ! -s "$WT_GH_LOG" ]] || exit 1
+if grep -E -- ' push' "$WT_GIT_LOG" >/dev/null; then
+  print -u2 'wt pr pushed before discovering it had no usable account'
+  exit 1
+fi
+
+wt_gh_alias() { return 1; }
+: > "$WT_GH_LOG"
+if _wt_pr >/dev/null 2>&1; then
+  print -u2 'wt pr continued after wt_gh_alias failed'
+  exit 1
+fi
+[[ ! -s "$WT_GH_LOG" ]] || exit 1
+
+# With no hook defined — the default, and every machine holding one GitHub
+# account — the calls stay bare and unchanged.
+unfunction wt_gh_alias
+export GH_MODE=view
+: > "$WT_GH_LOG"
+_wt_pr >/dev/null || exit 1
 grep -F -- 'gh pr view --json url -q .url' "$WT_GH_LOG" >/dev/null || exit 1
 ZSH
 

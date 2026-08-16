@@ -52,6 +52,25 @@ All optional environment variables:
 - `HANDOVER_REPO_NAME` — override the detected repo name in artifact metadata.
 - `HANDOVER_WORKSPACE_NAME` — override the detected workspace name.
 - `HANDOVER_MODEL_NAME` — override the detected model name.
+- `HANDOVER_GH_ALIAS` — account alias for the optional open-PR lookup in `state`.
+
+`HANDOVER_GH_ALIAS` exists for machines that hold more than one GitHub account and
+reach each through a `gh` alias. A bare `gh` runs as whichever account is globally
+active, so the open-PR line can answer for the wrong account — reported as no PR, or
+as a 404 that reads like a missing repository. Set the variable to the alias for the
+repository being snapshotted and the lookup runs as `gh <alias> pr view ...`:
+
+```bash
+HANDOVER_GH_ALIAS=work scripts/handover.sh state .
+```
+
+Leave it unset on a single-account machine — the default — and the call stays bare,
+unchanged. The value must be 1–64 characters starting with a letter or digit, then
+letters, digits, dots, underscores, or hyphens; it is passed to `gh` as a single
+argument and never expanded by a shell. An invalid value skips the lookup and says
+so rather than falling back to the bare call, since that fallback would silently
+query the active account. The lookup stays read-only and optional either way: no
+open pull request still prints `none`, and nothing else in the snapshot depends on it.
 
 Artifacts live under `<HANDOVER_HOME>/<repo-basename>-<path-hash>/` with private
 permissions (directories `700`, files `600`).

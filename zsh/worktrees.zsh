@@ -416,6 +416,29 @@ _wt_pr() {
   [[ "$branch" == "main" || "$branch" == "master" ]] \
     && { echo "wt pr: refusing to open a PR from $branch"; return 1; }
 
+  # `wt pr` is the only place wt writes to GitHub, and a bare `gh` runs as whichever
+  # account is globally active — so on a machine holding more than one it can open
+  # the pull request under the wrong identity, which stays invisible until someone
+  # reads the author. Define a `wt_gh_alias` function that prints the account alias
+  # for a repository and every gh call below becomes `gh <alias> ...`; leave it
+  # undefined, as a single-account machine would, and nothing changes. Resolve it
+  # here, before anything is committed, rebased, or pushed, so a hook that cannot
+  # answer costs nothing. There is deliberately no fallback: continuing as the
+  # active account is the mistake the hook exists to prevent.
+  local -a gh_acct
+  if (( $+functions[wt_gh_alias] )); then
+    local acct
+    acct=$(wt_gh_alias "$root") || {
+      echo "wt pr: wt_gh_alias failed for $root — refusing to run gh as the active account"
+      return 1
+    }
+    if [[ ! "$acct" =~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' ]]; then
+      echo "wt pr: wt_gh_alias did not return a usable account alias — refusing to run gh as the active account"
+      return 1
+    fi
+    gh_acct=("$acct")
+  fi
+
   if [[ -n "$msg" ]]; then
     if [[ -z $("$_WT_GIT" -C "$root" status --porcelain) ]]; then
       echo "wt pr: nothing to commit"
@@ -457,11 +480,11 @@ _wt_pr() {
   fi
 
   local pr_url
-  if pr_url=$(cd "$root" && gh pr view --json url -q .url 2>/dev/null) && [[ -n "$pr_url" ]]; then
+  if pr_url=$(cd "$root" && gh "${gh_acct[@]}" pr view --json url -q .url 2>/dev/null) && [[ -n "$pr_url" ]]; then
     echo "→ PR already exists"
   else
     echo "→ creating PR"
-    pr_url=$(cd "$root" && gh pr create --fill) || return 1
+    pr_url=$(cd "$root" && gh "${gh_acct[@]}" pr create --fill) || return 1
   fi
   echo "$pr_url"
 }
